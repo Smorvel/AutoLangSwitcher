@@ -29,18 +29,10 @@
 
 #include "layout_map.h"
 
-#ifdef _MSC_VER
-  #define LS_IID(T) __uuidof(T)
-  #define LS_CLSID_UIA __uuidof(CUIAutomation)
-#else
-  #define LS_IID(T) IID_##T
-  #define LS_CLSID_UIA CLSID_CUIAutomation
-#endif
-
 // ---------------------------------------------------------------- константы
 static const ULONG_PTR kMarker = 0x4C535743;  // метка наших собственных SendInput-событий
 static const UINT WM_TRIGGER = WM_APP + 2;
-static const UINT WM_PLAYSOUND = WM_APP + 3;
+static const UINT WM_APPLY_MOUSE = WM_APP + 4;
 
 enum PasteMode { PASTE_NEVER = 0, PASTE_AUTO = 1, PASTE_ALWAYS = 2 };
 
@@ -50,16 +42,19 @@ struct Settings {
     bool wholeText = true;     // false -> только последнее слово
     bool switchLayout = true;
     bool reselect = true;
-    bool trackAlways = false;  // true -> запоминать клавиши везде, а не только в текстовых полях
+    bool simpleSwitch = true;  // двойной Ctrl без текста просто переключает раскладку
+    bool gameMode = true;
     int pasteMode = PASTE_AUTO;
     int doubleCtrlMs = 500;
     int maxBuffer = 1000;
 };
 
 static Settings g_cfg;
-static std::vector<std::wstring> g_forceList, g_ignoreList;  // имена exe в нижнем регистре
+static std::vector<std::wstring> g_forceList, g_ignoreList, g_gameList;  // имена exe в нижнем регистре
+static std::vector<DWORD> g_chatKeys;
 static HWND g_hwnd = NULL;
 static HHOOK g_kbHook = NULL, g_msHook = NULL;
+static HWINEVENTHOOK g_winEvt = NULL;
 static std::wstring g_exePath, g_exeDir, g_iniPath;  // g_exeDir заканчивается на '\'
 
 static const wchar_t* kSection = L"LangSwitch";
@@ -93,6 +88,7 @@ static void LoadSettings() {
     g_cfg.sound = geti(L"Sound", 1) != 0;
     g_cfg.switchLayout = geti(L"SwitchLayout", 1) != 0;
     g_cfg.reselect = geti(L"Reselect", 1) != 0;
+    g_cfg.simpleSwitch = geti(L"SimpleSwitch", 1) != 0;
     g_cfg.doubleCtrlMs = geti(L"DoubleCtrlMs", 500);
     g_cfg.maxBuffer = geti(L"MaxBuffer", 1000);
     if (g_cfg.doubleCtrlMs < 100) g_cfg.doubleCtrlMs = 100;
@@ -107,14 +103,24 @@ static void LoadSettings() {
     else if (_wcsicmp(buf, L"always") == 0) g_cfg.pasteMode = PASTE_ALWAYS;
     else g_cfg.pasteMode = PASTE_AUTO;
 
-    GetPrivateProfileStringW(kSection, L"TrackMode", L"auto", buf, 32, ini);
-    g_cfg.trackAlways = _wcsicmp(buf, L"always") == 0;
+    GetPrivateProfileStringW(kSection, L"GameMode", L"auto", buf, 32, ini);
+    g_cfg.gameMode = _wcsicmp(buf, L"off") != 0;
 
     wchar_t lst[1024] = {0};
     GetPrivateProfileStringW(kSection, L"ForceTrack", L"", lst, 1024, ini);
     g_forceList = ParseList(lst);
     GetPrivateProfileStringW(kSection, L"IgnoreProcesses", L"", lst, 1024, ini);
     g_ignoreList = ParseList(lst);
+    GetPrivateProfileStringW(kSection, L"GameProcesses", L"", lst, 1024, ini);
+    g_gameList = ParseList(lst);
+
+    GetPrivateProfileStringW(kSection, L"GameChatKeys", L"ENTER", lst, 1024, ini);
+    g_chatKeys.clear();
+    for (const std::wstring& t : ParseList(lst)) {
+        if (t == L"enter") g_chatKeys.push_back(VK_RETURN);
+        else if (t.size() == 1 && iswalnum(t[0])) g_chatKeys.push_back((DWORD)towupper(t[0]));
+    }
+    if (g_chatKeys.empty()) g_chatKeys.push_back(VK_RETURN);
 }
 
 static void SaveDefaultSettings() {
@@ -126,8 +132,11 @@ static void SaveDefaultSettings() {
     put(L"Scope", L"all");
     put(L"SwitchLayout", L"1");
     put(L"Reselect", L"1");
+    put(L"SimpleSwitch", L"1");
     put(L"PasteMode", L"auto");
-    put(L"TrackMode", L"auto");
+    put(L"GameMode", L"auto");
+    put(L"GameChatKeys", L"ENTER");
+    put(L"GameProcesses", L"");
     put(L"ForceTrack", L"");
     put(L"IgnoreProcesses", L"");
     put(L"DoubleCtrlMs", L"500");
@@ -152,7 +161,7 @@ static bool g_selHint = false;      // есть вероятность, что �
 static std::atomic<bool> g_busy(false);
 static std::atomic<bool> g_resetAfter(false);
 
-// состояние хуков (используется только потоком хуков)
+// состояние хуков (используется только главным потоком, где стоят хуки)
 static bool g_caps = false, g_capsHeld = false;
 static bool g_ctrlDown = false, g_ctrlDirty = false;
 static DWORD g_ctrlDownTick = 0, g_lastTap = 0;
@@ -160,15 +169,17 @@ static POINT g_downPt = {0, 0}, g_lastDownPt = {0, 0};
 static DWORD g_lastDownTime = 0;
 static int g_clickCount = 0;
 
-// состояние фокуса (пишет UIA-поток и поток хуков)
-static std::atomic<bool> g_uiaOk(false);     // UI Automation работает
-static std::atomic<bool> g_uiaText(false);   // фокус в текстовом поле
-static std::atomic<HWND> g_uiaFg((HWND)NULL);  // окно, для которого получено значение g_uiaText
-static std::atomic<bool> g_fgIgnored(false); // активная программа в IgnoreProcesses
-static std::atomic<bool> g_fgForce(false);   // активная программа в ForceTrack
-static HWND g_cachedFg = NULL;               // только поток хуков
-static HANDLE g_quitEvt = NULL, g_refocusEvt = NULL;
-static HANDLE g_uiaThread = NULL;
+// состояние активного окна
+static HWND g_cachedFg = NULL;
+static DWORD g_lastFgCheck = 0;
+static std::atomic<bool> g_fgIgnored(false);  // программа в IgnoreProcesses
+static std::atomic<bool> g_fgForce(false);    // программа в ForceTrack
+static std::atomic<bool> g_fgGame(false);     // окно похоже на игру
+static bool g_chatMode = false;               // в игре открыт чат
+static bool g_mouseWanted = true;
+
+// звук играет в отдельном потоке, чтобы не задерживать обработку ввода
+static HANDLE g_soundEvt = NULL, g_quitEvt = NULL, g_soundThread = NULL;
 
 // ---------------------------------------------------------------- утилиты раскладок
 static HKL FgLayout() {
@@ -211,7 +222,36 @@ static void SwitchLayoutTo(bool ru) {
     ActivateLayout(ru);
 }
 
-// ---------------------------------------------------------------- процессы
+// ---------------------------------------------------------------- звук
+static void PlaySwitchSound() {
+    std::wstring wav = g_exeDir + L"switch.wav";
+    if (GetFileAttributesW(wav.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        PlaySoundW(wav.c_str(), NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+        return;
+    }
+    std::wstring mp3 = g_exeDir + L"switch.mp3";
+    if (GetFileAttributesW(mp3.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        mciSendStringW(L"close lssnd", NULL, 0, NULL);
+        std::wstring cmd = L"open \"" + mp3 + L"\" type mpegvideo alias lssnd";
+        if (mciSendStringW(cmd.c_str(), NULL, 0, NULL) == 0) mciSendStringW(L"play lssnd", NULL, 0, NULL);
+    }
+}
+
+static unsigned __stdcall SoundThread(void*) {
+    HANDLE evts[2] = { g_quitEvt, g_soundEvt };
+    for (;;) {
+        DWORD w = WaitForMultipleObjects(2, evts, FALSE, INFINITE);
+        if (w != WAIT_OBJECT_0 + 1) break;
+        PlaySwitchSound();
+    }
+    return 0;
+}
+
+static void RequestSound() {
+    if (g_cfg.sound && g_soundEvt) SetEvent(g_soundEvt);
+}
+
+// ---------------------------------------------------------------- процессы и окна
 static std::wstring ProcNameOfWindow(HWND h) {
     DWORD pid = 0;
     if (h) GetWindowThreadProcessId(h, &pid);
@@ -235,158 +275,100 @@ static bool InList(const std::vector<std::wstring>& l, const std::wstring& name)
     return std::find(l.begin(), l.end(), name) != l.end();
 }
 
-// Вызывается из потока хуков. Если сменилось активное окно: обновляем флаги программы,
-// сбрасываем накопленный текст и просим UIA-поток заново определить, где стоит фокус.
-static void UpdateFgFlags() {
-    HWND fg = GetForegroundWindow();
-    if (fg == g_cachedFg) return;
-    g_cachedFg = fg;
-    g_fgIgnored = false;
-    g_fgForce = false;
-    if (!g_ignoreList.empty() || !g_forceList.empty()) {
-        std::wstring name = ProcNameOfWindow(fg);
-        if (!name.empty()) {
-            if (InList(g_ignoreList, name)) g_fgIgnored = true;
-            if (InList(g_forceList, name)) g_fgForce = true;
-        }
-    }
-    {
-        Lock l;
-        g_buf.clear();
-        g_selHint = false;
-    }
-    if (g_refocusEvt) SetEvent(g_refocusEvt);
-}
-
-// Нужно ли сейчас запоминать нажатия клавиш (т.е. стоит ли фокус в поле для текста)
-static bool TrackingActive() {
-    if (g_cfg.trackAlways || g_fgForce) return true;
-    if (!g_uiaOk) return true;  // UI Automation недоступен — работаем без фильтра
-    HWND fg = GetForegroundWindow();
-    if (g_uiaText && g_uiaFg == fg) return true;
-    // запасной вариант: классическая системная каретка (Блокнот, Word, обычные поля Win32)
-    GUITHREADINFO gi;
-    ZeroMemory(&gi, sizeof(gi));
-    gi.cbSize = sizeof(gi);
-    if (GetGUIThreadInfo(0, &gi) && gi.hwndCaret) return true;
-    return false;
-}
-
-// ---------------------------------------------------------------- UI Automation: фокус в текстовом поле?
 static bool IsBrowserWindow(HWND fg) {
     wchar_t cls[64] = {0};
     if (fg) GetClassNameW(fg, cls, 64);
     return wcsncmp(cls, L"Chrome_WidgetWin", 16) == 0 || wcscmp(cls, L"MozillaWindowClass") == 0;
 }
 
-static IUnknown* GetPattern(IUIAutomationElement* el, PATTERNID id) {
-    IUnknown* u = NULL;
-    if (FAILED(el->GetCurrentPattern(id, &u))) return NULL;
-    return u;
+// Окно без рамки, закрывающее весь монитор (полноэкранный режим игры)
+static bool IsFullscreenGameWindow(HWND hwnd) {
+    if (!hwnd) return false;
+    wchar_t cls[64] = {0};
+    GetClassNameW(hwnd, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"Shell_TrayWnd")) return false;
+    if (IsBrowserWindow(hwnd)) return false;  // браузеры и Electron-приложения в полноэкранном режиме - не игры
+
+    DWORD style = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+    if ((style & WS_CAPTION) == WS_CAPTION) return false;  // обычное окно с заголовком
+
+    RECT r;
+    if (!GetWindowRect(hwnd, &r)) return false;
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi;
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (!mon || !GetMonitorInfoW(mon, &mi)) return false;
+    return r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top &&
+           r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
 }
 
-static bool IsTextElement(IUIAutomationElement* el, bool browserWnd) {
-    BOOL pw = FALSE;
-    if (SUCCEEDED(el->get_CurrentIsPassword(&pw)) && pw) return false;  // пароли не запоминаем
+// Фокус на элементе, где печатать текст нельзя (список файлов Проводника, дерево папок, рабочий стол)
+static bool FocusIsNonText() {
+    if (g_fgForce) return false;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    wchar_t cls[64] = {0};
+    GetClassNameW(fg, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW")) return true;
 
-    CONTROLTYPEID t = 0;
-    if (FAILED(el->get_CurrentControlType(&t))) return false;
-    if (t == UIA_EditControlTypeId) return true;
-
-    // поле со значением, доступным для записи (редактируемый ComboBox и т.п.)
-    bool writable = false;
-    if (IUnknown* u = GetPattern(el, UIA_ValuePatternId)) {
-        IUIAutomationValuePattern* vp = NULL;
-        if (SUCCEEDED(u->QueryInterface(LS_IID(IUIAutomationValuePattern), (void**)&vp)) && vp) {
-            BOOL ro = TRUE;
-            if (SUCCEEDED(vp->get_CurrentIsReadOnly(&ro)) && !ro) writable = true;
-            vp->Release();
-        }
-        u->Release();
-    }
-    if (writable) return true;
-
-    // редакторы текста (Word и т.п.); сама веб-страница в браузере текстовым полем не считается
-    if (t != UIA_PaneControlTypeId && !(t == UIA_DocumentControlTypeId && browserWnd)) {
-        if (IUnknown* u = GetPattern(el, UIA_TextPatternId)) {
-            u->Release();
-            return true;
-        }
-    }
+    GUITHREADINFO gi;
+    ZeroMemory(&gi, sizeof(gi));
+    gi.cbSize = sizeof(gi);
+    DWORD tid = GetWindowThreadProcessId(fg, NULL);
+    if (!GetGUIThreadInfo(tid, &gi) || !gi.hwndFocus) return false;
+    GetClassNameW(gi.hwndFocus, cls, 64);
+    static const wchar_t* kNonText[] = {
+        L"SysListView32", L"DirectUIHWND", L"SysTreeView32", L"NamespaceTreeControl", L"SHELLDLL_DefView"
+    };
+    for (const wchar_t* c : kNonText)
+        if (!wcscmp(cls, c)) return true;
     return false;
 }
 
-static void UpdateTextState(bool isText, HWND fg) {
-    bool oldText = g_uiaText.exchange(isText);
-    HWND oldFg = g_uiaFg.exchange(fg);
-    if (oldText != isText || oldFg != fg) {
+// Вызывается в главном потоке (из хука клавиатуры и из WinEvent-колбэка).
+// Обновляет сведения об активном окне: игнор, игра, принудительное запоминание.
+static void RefreshFgState() {
+    HWND fg = GetForegroundWindow();
+    DWORD now = GetTickCount();
+    const bool changed = (fg != g_cachedFg);
+    if (!changed && now - g_lastFgCheck < 1000) return;
+    g_lastFgCheck = now;
+
+    static bool listed = false;
+    if (changed) {
+        g_cachedFg = fg;
+        bool ign = false, frc = false;
+        listed = false;
+        if (fg && (!g_ignoreList.empty() || !g_forceList.empty() || !g_gameList.empty())) {
+            std::wstring name = ProcNameOfWindow(fg);
+            if (!name.empty()) {
+                ign = InList(g_ignoreList, name);
+                frc = InList(g_forceList, name);
+                listed = InList(g_gameList, name);
+            }
+        }
+        g_fgIgnored = ign;
+        g_fgForce = frc;
+        g_chatMode = false;
         Lock l;
         g_buf.clear();
         g_selHint = false;
     }
+
+    const bool game = !g_fgForce && !g_fgIgnored && (listed || (g_cfg.gameMode && IsFullscreenGameWindow(fg)));
+    g_fgGame = game;
+
+    // Перехват мыши нужен только в обычных окнах: в играх он зря нагружает систему
+    const bool wantMouse = !g_fgIgnored && !game;
+    if (wantMouse != g_mouseWanted) {
+        g_mouseWanted = wantMouse;
+        PostMessageW(g_hwnd, WM_APPLY_MOUSE, 0, 0);
+    }
 }
 
-static void OnFocusElement(IUIAutomationElement* el) {
-    HWND fg = GetForegroundWindow();
-    bool isText = el ? IsTextElement(el, IsBrowserWindow(fg)) : false;
-    UpdateTextState(isText, fg);
-}
-
-class FocusHandler : public IUIAutomationFocusChangedEventHandler {
-    LONG m_ref;
-public:
-    FocusHandler() : m_ref(1) {}
-    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&m_ref); }
-    ULONG STDMETHODCALLTYPE Release() override {
-        LONG r = InterlockedDecrement(&m_ref);
-        if (r == 0) delete this;
-        return (ULONG)r;
-    }
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
-        if (!ppv) return E_POINTER;
-        if (riid == IID_IUnknown || riid == LS_IID(IUIAutomationFocusChangedEventHandler)) {
-            *ppv = static_cast<IUIAutomationFocusChangedEventHandler*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppv = NULL;
-        return E_NOINTERFACE;
-    }
-    HRESULT STDMETHODCALLTYPE HandleFocusChangedEvent(IUIAutomationElement* sender) override {
-        OnFocusElement(sender);
-        return S_OK;
-    }
-};
-
-static unsigned __stdcall UiaThread(void*) {
-    HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    IUIAutomation* uia = NULL;
-    HRESULT hr = CoCreateInstance(LS_CLSID_UIA, NULL, CLSCTX_INPROC_SERVER, LS_IID(IUIAutomation), (void**)&uia);
-    if (SUCCEEDED(hr) && uia) {
-        FocusHandler* handler = new FocusHandler();
-        if (SUCCEEDED(uia->AddFocusChangedEventHandler(NULL, handler))) {
-            g_uiaOk = true;
-            HANDLE evts[2] = { g_quitEvt, g_refocusEvt };
-            // начальное состояние
-            SetEvent(g_refocusEvt);
-            for (;;) {
-                DWORD w = WaitForMultipleObjects(2, evts, FALSE, INFINITE);
-                if (w != WAIT_OBJECT_0 + 1) break;  // выход
-                IUIAutomationElement* el = NULL;
-                if (SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
-                    OnFocusElement(el);
-                    el->Release();
-                } else {
-                    UpdateTextState(false, GetForegroundWindow());
-                }
-            }
-            uia->RemoveFocusChangedEventHandler(handler);
-        }
-        handler->Release();
-        uia->Release();
-    }
-    if (SUCCEEDED(coHr)) CoUninitialize();
-    return 0;
+static bool IsChatOpenKey(DWORD vk) {
+    return std::find(g_chatKeys.begin(), g_chatKeys.end(), vk) != g_chatKeys.end();
 }
 
 // ---------------------------------------------------------------- SendInput
@@ -541,7 +523,13 @@ static bool FocusIsBrowserUiEdit() {
     IUIAutomationElement* focused = NULL;
     IUIAutomationTreeWalker* walker = NULL;
 
-    HRESULT hr = CoCreateInstance(LS_CLSID_UIA, NULL, CLSCTX_INPROC_SERVER, LS_IID(IUIAutomation), (void**)&uia);
+#ifdef _MSC_VER
+    HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), NULL, CLSCTX_INPROC_SERVER,
+                                  __uuidof(IUIAutomation), (void**)&uia);
+#else
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER,
+                                  IID_IUIAutomation, (void**)&uia);
+#endif
 
     if (SUCCEEDED(hr) && uia && SUCCEEDED(uia->GetFocusedElement(&focused)) && focused) {
         CONTROLTYPEID type = 0;
@@ -584,7 +572,11 @@ static bool UsePasteForBuffer() {
     // auto: только адресная строка браузеров (Chrome, Edge, Opera, Firefox...).
     // Её подсказки/автодополнение реагируют на каждый Backspace и символ, из-за этого текст "печатается" медленно.
     if (!IsBrowserWindow(GetForegroundWindow())) return false;
-    return FocusIsBrowserUiEdit();
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    bool r = FocusIsBrowserUiEdit();
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return r;
 }
 
 static bool ConvertSelection() {
@@ -634,7 +626,7 @@ static bool ConvertSelection() {
     if (saved) bak.Restore();
     if (re) { Lock l; g_selHint = true; }
 
-    PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
+    RequestSound();
 
     bool endRu = IsRuLayoutNow();
     for (size_t i = conv.size(); i-- > 0;) {
@@ -709,7 +701,7 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
         }
     }
 
-    PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
+    RequestSound();
 
     bool endRu = neu.back().ru;
     for (size_t i = neu.size(); i-- > 0;) {
@@ -718,15 +710,13 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
     SwitchLayoutTo(endRu);
 }
 
-// Текста нет — просто переключаем раскладку RU <-> EN
+// Текста нет — просто переключаем раскладку RU <-> EN (из третьей раскладки переходим на русскую)
 static void ToggleLayout() {
     ActivateLayout(!IsRuLayoutNow());
-    PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
+    RequestSound();
 }
 
 static unsigned __stdcall ConvertThread(void*) {
-    HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-
     Sleep(30);  // чтобы физическое отпускание Ctrl успело обработаться
 
     bool hint;
@@ -738,17 +728,19 @@ static unsigned __stdcall ConvertThread(void*) {
         g_resetAfter = false;
     }
 
-    // Ctrl+C отправляем только если фокус в текстовом поле (иначе, например, в Проводнике скопируются файлы)
-    if (hint && !TrackingActive()) hint = false;
+    // Ctrl+C не отправляем, если фокус на списке файлов и т.п. (иначе скопируются файлы)
+    if (hint && FocusIsNonText()) hint = false;
 
     bool done = false;
     if (hint) done = ConvertSelection();
     if (!done) {
-        if (snap.empty()) ToggleLayout();
-        else ConvertBuffer(snap);
+        if (snap.empty()) {
+            if (g_cfg.simpleSwitch) ToggleLayout();
+        } else {
+            ConvertBuffer(snap);
+        }
     }
 
-    if (SUCCEEDED(coHr)) CoUninitialize();
     g_busy = false;
     return 0;
 }
@@ -770,7 +762,7 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
     const KBDLLHOOKSTRUCT* k = (const KBDLLHOOKSTRUCT*)lp;
     if (k->dwExtraInfo == kMarker) return CallNextHookEx(NULL, code, wp, lp);  // наши собственные события
 
-    UpdateFgFlags();
+    RefreshFgState();
     const bool ignored = g_fgIgnored;
 
     const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
@@ -820,13 +812,30 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
 
     if (IsModifierVk(vk)) return CallNextHookEx(NULL, code, wp, lp);
 
-    // Фокус не в поле для текста (игра, список файлов и т.п.) — ничего не запоминаем
-    if (!TrackingActive()) return CallNextHookEx(NULL, code, wp, lp);
+    const bool ctrl = g_ctrlDown;
+
+    if (g_fgGame) {
+        // Игра: ничего не запоминаем, пока не открыт чат
+        if (!g_chatMode) {
+            if (!ctrl && IsChatOpenKey(vk)) {
+                g_chatMode = true;
+                Lock l;
+                g_buf.clear();
+                g_selHint = false;
+            }
+            return CallNextHookEx(NULL, code, wp, lp);
+        }
+    } else if (FocusIsNonText()) {
+        // Список файлов Проводника, рабочий стол и т.п. — не запоминаем
+        Lock l;
+        g_buf.clear();
+        g_selHint = false;
+        return CallNextHookEx(NULL, code, wp, lp);
+    }
 
     const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
     const bool win = ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) != 0;
-    const bool ctrl = g_ctrlDown;
     const bool nav = (vk >= VK_PRIOR && vk <= VK_DOWN);
 
     // Горячие клавиши: сбрасываем буфер. Ctrl+A и Ctrl/Shift+стрелки — вероятное выделение.
@@ -842,6 +851,10 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
         if (g_selHint) { g_buf.clear(); g_selHint = false; }
         else if (!g_buf.empty()) g_buf.pop_back();
         return CallNextHookEx(NULL, code, wp, lp);
+    }
+
+    if (vk == VK_RETURN || vk == VK_ESCAPE) {
+        if (g_fgGame) g_chatMode = false;  // чат в игре закрыт
     }
 
     if (vk == VK_RETURN || vk == VK_TAB || vk == VK_ESCAPE || vk == VK_DELETE || vk == VK_INSERT ||
@@ -893,9 +906,6 @@ static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
     const MSLLHOOKSTRUCT* m = (const MSLLHOOKSTRUCT*)lp;
     if (m->dwExtraInfo == kMarker || g_busy) return CallNextHookEx(NULL, code, wp, lp);
 
-    UpdateFgFlags();
-    if (g_fgIgnored) return CallNextHookEx(NULL, code, wp, lp);
-
     switch (wp) {
         case WM_LBUTTONDOWN: {
             if (g_ctrlDown) g_ctrlDirty = true;
@@ -917,7 +927,7 @@ static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONUP: {
             const bool drag = abs(m->pt.x - g_downPt.x) > 3 || abs(m->pt.y - g_downPt.y) > 3;
             const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            if (drag || g_clickCount >= 2 || shift) {
+            if ((drag || g_clickCount >= 2 || shift) && !FocusIsNonText()) {
                 Lock l;
                 g_selHint = true;
             }
@@ -937,34 +947,34 @@ static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
-// ---------------------------------------------------------------- звук
-static void PlaySwitchSound() {
-    if (!g_cfg.sound) return;
-    std::wstring wav = g_exeDir + L"switch.wav";
-    if (GetFileAttributesW(wav.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        PlaySoundW(wav.c_str(), NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
-        return;
-    }
-    std::wstring mp3 = g_exeDir + L"switch.mp3";
-    if (GetFileAttributesW(mp3.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        mciSendStringW(L"close lssnd", NULL, 0, NULL);
-        std::wstring cmd = L"open \"" + mp3 + L"\" type mpegvideo alias lssnd";
-        if (mciSendStringW(cmd.c_str(), NULL, 0, NULL) == 0) mciSendStringW(L"play lssnd", NULL, 0, NULL);
-    }
+// Событие смены активного окна
+static void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    RefreshFgState();
 }
 
 // ---------------------------------------------------------------- окно (скрытое, нужно для сообщений и буфера обмена)
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
-        case WM_TRIGGER:
+        case WM_TRIGGER: {
+            if (!g_cfg.simpleSwitch) {
+                // без текста и без простого переключателя делать нечего
+                Lock lk;
+                if (g_buf.empty() && !g_selHint) return 0;
+            }
             if (!g_busy.exchange(true)) {
                 uintptr_t th = _beginthreadex(NULL, 0, ConvertThread, NULL, 0, NULL);
                 if (th) CloseHandle((HANDLE)th);
                 else g_busy = false;
             }
             return 0;
-        case WM_PLAYSOUND:
-            PlaySwitchSound();
+        }
+        case WM_APPLY_MOUSE:
+            if (g_mouseWanted && !g_msHook) {
+                g_msHook = SetWindowsHookExW(WH_MOUSE_LL, MsProc, GetModuleHandleW(NULL), 0);
+            } else if (!g_mouseWanted && g_msHook) {
+                UnhookWindowsHookEx(g_msHook);
+                g_msHook = NULL;
+            }
             return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -1000,13 +1010,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"LangSwitch", WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
     if (!g_hwnd) return 1;
 
-    // Поток UI Automation: следит за тем, где стоит фокус (поле для текста или нет)
+    // Звук: отдельный поток
     g_quitEvt = CreateEventW(NULL, TRUE, FALSE, NULL);
-    g_refocusEvt = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!g_cfg.trackAlways) {
-        uintptr_t th = _beginthreadex(NULL, 0, UiaThread, NULL, 0, NULL);
-        g_uiaThread = (HANDLE)th;
-    }
+    g_soundEvt = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_soundThread = (HANDLE)_beginthreadex(NULL, 0, SoundThread, NULL, 0, NULL);
 
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(NULL), 0);
     g_msHook = SetWindowsHookExW(WH_MOUSE_LL, MsProc, GetModuleHandleW(NULL), 0);
@@ -1015,18 +1022,23 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
+    g_winEvt = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, WinEventProc, 0, 0,
+                               WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    RefreshFgState();
+
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
+    if (g_winEvt) UnhookWinEvent(g_winEvt);
     UnhookWindowsHookEx(g_kbHook);
     if (g_msHook) UnhookWindowsHookEx(g_msHook);
     SetEvent(g_quitEvt);
-    if (g_uiaThread) {
-        WaitForSingleObject(g_uiaThread, 1000);
-        CloseHandle(g_uiaThread);
+    if (g_soundThread) {
+        WaitForSingleObject(g_soundThread, 1000);
+        CloseHandle(g_soundThread);
     }
     DeleteCriticalSection(&g_cs);
     if (mtx) CloseHandle(mtx);
