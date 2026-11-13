@@ -10,12 +10,20 @@ if(MSVC)
   add_compile_options(/utf-8 /W3)
 endif()
 
-add_executable(QuickGroup WIN32
+set(QG_SOURCES
   src/main.cpp
   src/layout_map.cpp
 )
 
-target_link_libraries(QuickGroup PRIVATE user32 gdi32 shell32 advapi32 winmm)
+# Иконка приложения: если есть assets/app.ico, она встраивается в exe
+if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets/app.ico")
+  enable_language(RC)
+  list(APPEND QG_SOURCES src/app.rc)
+endif()
+
+add_executable(QuickGroup WIN32 ${QG_SOURCES})
+
+target_link_libraries(QuickGroup PRIVATE user32 winmm)
 
 if(MINGW)
   target_link_options(QuickGroup PRIVATE -static -static-libgcc -static-libstdc++)
