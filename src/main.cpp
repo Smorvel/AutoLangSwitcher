@@ -146,37 +146,10 @@ static HKL FindLayout(bool ru) {
 
 static void SwitchLayoutTo(bool ru) {
     if (!g_cfg.switchLayout) return;
-
-    HWND fg = GetForegroundWindow();
-    if (!fg) return;
-
-    DWORD tid = GetWindowThreadProcessId(fg, NULL);
-    if (!tid) return;
-
     HKL h = FindLayout(ru);
-    if (!h || h == GetKeyboardLayout(tid)) return;
-
-    GUITHREADINFO gi = {};
-    gi.cbSize = sizeof(gi);
-
-    HWND target = NULL;
-
-    if (GetGUIThreadInfo(tid, &gi)) {
-        target = gi.hwndFocus;
-
-        if (!target)
-            target = gi.hwndActive;
-    }
-
-    if (!target)
-        target = fg;
-
-    PostMessageW(
-        target,
-        WM_INPUTLANGCHANGEREQUEST,
-        0,
-        (LPARAM)h
-    );
+    HWND fg = GetForegroundWindow();
+    if (!h || !fg || h == FgLayout()) return;
+    PostMessageW(fg, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)h);
 }
 
 // ---------------------------------------------------------------- SendInput
