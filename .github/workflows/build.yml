@@ -1,0 +1,63 @@
+name: Build QuickGroup for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exe = Get-ChildItem -Path build -Recurse -Filter QuickGroup.exe | Select-Object -First 1
+          Copy-Item $exe.FullName dist/QuickGroup.exe
+          Copy-Item assets/QuickGroup.ini dist/QuickGroup.ini
+
+          $hasWav = Test-Path assets/switch.wav
+          $hasMp3 = Test-Path assets/switch.mp3
+          if ($hasWav) { Copy-Item assets/switch.wav dist/switch.wav }
+          if ($hasMp3) { Copy-Item assets/switch.mp3 dist/switch.mp3 }
+
+          if (-not $hasWav -and -not $hasMp3) {
+            # Тихий файл-заглушка (0.1 сек тишины)
+            $n = 800
+            $ms = New-Object System.IO.MemoryStream
+            $bw = New-Object System.IO.BinaryWriter($ms)
+            $bw.Write([Text.Encoding]::ASCII.GetBytes('RIFF'))
+            $bw.Write([int32](36 + $n))
+            $bw.Write([Text.Encoding]::ASCII.GetBytes('WAVE'))
+            $bw.Write([Text.Encoding]::ASCII.GetBytes('fmt '))
+            $bw.Write([int32]16)
+            $bw.Write([int16]1)
+            $bw.Write([int16]1)
+            $bw.Write([int32]8000)
+            $bw.Write([int32]8000)
+            $bw.Write([int16]1)
+            $bw.Write([int16]8)
+            $bw.Write([Text.Encoding]::ASCII.GetBytes('data'))
+            $bw.Write([int32]$n)
+            $silence = [byte[]]::new($n)
+            for ($i = 0; $i -lt $n; $i++) { $silence[$i] = 128 }
+            $bw.Write($silence)
+            $bw.Flush()
+            $out = Join-Path $PWD 'dist/switch.wav'
+            [IO.File]::WriteAllBytes($out, $ms.ToArray())
+          }
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickGroup-Windows
+          path: dist/
