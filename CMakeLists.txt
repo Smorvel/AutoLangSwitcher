@@ -23,7 +23,7 @@ endif()
 
 add_executable(LangSwitch WIN32 ${LS_SOURCES})
 
-target_link_libraries(LangSwitch PRIVATE user32 winmm ole32 oleaut32 uuid)
+target_link_libraries(LangSwitch PRIVATE user32 winmm ole32 oleaut32 uuid advapi32)
 
 if(MINGW)
   target_link_options(LangSwitch PRIVATE -static -static-libgcc -static-libstdc++)
