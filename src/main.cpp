@@ -19,6 +19,7 @@
 #include <uiautomationclient.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <string>
@@ -144,14 +145,6 @@ static HKL FindLayout(bool ru) {
     return found;
 }
 
-static void SwitchLayoutTo(bool ru) {
-    if (!g_cfg.switchLayout) return;
-    HKL h = FindLayout(ru);
-    HWND fg = GetForegroundWindow();
-    if (!h || !fg || h == FgLayout()) return;
-    PostMessageW(fg, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)h);
-}
-
 // ---------------------------------------------------------------- SendInput
 static INPUT KeyInput(WORD vk, bool up) {
     INPUT in;
@@ -204,6 +197,79 @@ static void SendChord(WORD mod, WORD key) {
     std::vector<INPUT> v;
     AddChord(v, mod, key);
     SendBatch(v);
+}
+
+// ---------------------------------------------------------------- переключение раскладки
+// Эмуляция системной горячей клавиши смены раскладки (Alt+Shift / Ctrl+Shift / `),
+// то есть то же самое, что нажать её руками. Сообщения WM_INPUTLANGCHANGEREQUEST не используются.
+
+// Тип горячей клавиши из настроек Windows: 1 = Alt+Shift, 2 = Ctrl+Shift, 3 = отключена, 4 = клавиша ` (Ё)
+static int ReadSystemHotkeyType() {
+    int type = 1;  // по умолчанию в Windows — Alt+Shift
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Keyboard Layout\\Toggle", 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        const wchar_t* names[2] = {L"Language Hotkey", L"Hotkey"};
+        for (int i = 0; i < 2; ++i) {
+            wchar_t buf[16] = {0};
+            DWORD sz = sizeof(buf) - sizeof(wchar_t);
+            DWORD t = 0;
+            if (RegQueryValueExW(k, names[i], NULL, &t, (LPBYTE)buf, &sz) == ERROR_SUCCESS && t == REG_SZ) {
+                type = _wtoi(buf);
+                break;
+            }
+        }
+        RegCloseKey(k);
+    }
+    return type;
+}
+
+static bool SendLayoutHotkey() {
+    const int t = ReadSystemHotkeyType();
+    std::vector<INPUT> v;
+    if (t == 1) {          // Alt+Shift
+        v.push_back(KeyInput(VK_LMENU, false));
+        v.push_back(KeyInput(VK_LSHIFT, false));
+        v.push_back(KeyInput(VK_LSHIFT, true));
+        v.push_back(KeyInput(VK_LMENU, true));
+    } else if (t == 2) {   // Ctrl+Shift
+        v.push_back(KeyInput(VK_LCONTROL, false));
+        v.push_back(KeyInput(VK_LSHIFT, false));
+        v.push_back(KeyInput(VK_LSHIFT, true));
+        v.push_back(KeyInput(VK_LCONTROL, true));
+    } else if (t == 4) {   // клавиша ` (Ё)
+        v.push_back(KeyInput(VK_OEM_3, false));
+        v.push_back(KeyInput(VK_OEM_3, true));
+    } else {
+        return false;      // горячая клавиша отключена в настройках Windows
+    }
+    SendBatch(v);
+    return true;
+}
+
+static bool WaitForLayout(WORD wantLang, DWORD ms) {
+    const DWORD t0 = GetTickCount();
+    for (;;) {
+        if (PrimaryLang(FgLayout()) == wantLang) return true;
+        if (GetTickCount() - t0 >= ms) return false;
+        Sleep(10);
+    }
+}
+
+static void SwitchLayoutTo(bool ru) {
+    if (!g_cfg.switchLayout) return;
+    const WORD want = ru ? LANG_RUSSIAN : LANG_ENGLISH;
+    if (PrimaryLang(FgLayout()) == want) return;
+    if (!FindLayout(ru)) return;  // нужная раскладка не установлена
+
+    // Нажимаем горячую клавишу, пока не получим нужную раскладку (при 3+ раскладках они идут по кругу)
+    int n = GetKeyboardLayoutList(0, NULL);
+    if (n < 2) return;
+    if (n > 8) n = 8;
+    for (int i = 0; i < n; ++i) {
+        if (PrimaryLang(FgLayout()) == want) return;
+        if (!SendLayoutHotkey()) return;
+        if (WaitForLayout(want, 200)) return;
+    }
 }
 
 // ---------------------------------------------------------------- буфер обмена
