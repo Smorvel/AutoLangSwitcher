@@ -13,7 +13,6 @@
 #endif
 
 #include <windows.h>
-#include <shellapi.h>
 #include <mmsystem.h>
 #include <process.h>
 
@@ -28,39 +27,32 @@
 
 // ---------------------------------------------------------------- константы
 static const ULONG_PTR kMarker = 0x51474D4B;  // метка наших собственных SendInput-событий
-static const UINT WM_TRAY = WM_APP + 1;
 static const UINT WM_TRIGGER = WM_APP + 2;
 static const UINT WM_PLAYSOUND = WM_APP + 3;
 
-enum {
-    ID_ENABLE = 1001, ID_SOUND, ID_WORD, ID_AUTOSTART, ID_OPEN_INI, ID_RELOAD, ID_EXIT
-};
+enum PasteMode { PASTE_NEVER = 0, PASTE_AUTO = 1, PASTE_ALWAYS = 2 };
 
 // ---------------------------------------------------------------- настройки
 struct Settings {
-    bool enabled = true;
     bool sound = true;
     bool wholeText = true;     // false -> только последнее слово
     bool switchLayout = true;
     bool reselect = true;
+    int pasteMode = PASTE_AUTO;
     int doubleCtrlMs = 500;
     int maxBuffer = 1000;
 };
 
 static Settings g_cfg;
-static HINSTANCE g_hInst = NULL;
 static HWND g_hwnd = NULL;
 static HHOOK g_kbHook = NULL, g_msHook = NULL;
 static std::wstring g_exePath, g_exeDir, g_iniPath;  // g_exeDir заканчивается на '\'
-static UINT g_taskbarCreated = 0;
-static HICON g_iconOn = NULL, g_iconOff = NULL;
 
 static void LoadSettings() {
     const wchar_t* ini = g_iniPath.c_str();
     auto geti = [&](const wchar_t* key, int def) {
         return (int)GetPrivateProfileIntW(L"QuickGroup", key, def, ini);
     };
-    g_cfg.enabled = geti(L"Enabled", 1) != 0;
     g_cfg.sound = geti(L"Sound", 1) != 0;
     g_cfg.switchLayout = geti(L"SwitchLayout", 1) != 0;
     g_cfg.reselect = geti(L"Reselect", 1) != 0;
@@ -69,23 +61,28 @@ static void LoadSettings() {
     if (g_cfg.doubleCtrlMs < 100) g_cfg.doubleCtrlMs = 100;
     if (g_cfg.maxBuffer < 10) g_cfg.maxBuffer = 10;
 
-    wchar_t scope[32] = {0};
-    GetPrivateProfileStringW(L"QuickGroup", L"Scope", L"all", scope, 32, ini);
-    g_cfg.wholeText = _wcsicmp(scope, L"word") != 0;
+    wchar_t buf[32] = {0};
+    GetPrivateProfileStringW(L"QuickGroup", L"Scope", L"all", buf, 32, ini);
+    g_cfg.wholeText = _wcsicmp(buf, L"word") != 0;
+
+    GetPrivateProfileStringW(L"QuickGroup", L"PasteMode", L"auto", buf, 32, ini);
+    if (_wcsicmp(buf, L"never") == 0) g_cfg.pasteMode = PASTE_NEVER;
+    else if (_wcsicmp(buf, L"always") == 0) g_cfg.pasteMode = PASTE_ALWAYS;
+    else g_cfg.pasteMode = PASTE_AUTO;
 }
 
-static void SaveSettings() {
+static void SaveDefaultSettings() {
     const wchar_t* ini = g_iniPath.c_str();
     auto put = [&](const wchar_t* key, const std::wstring& v) {
         WritePrivateProfileStringW(L"QuickGroup", key, v.c_str(), ini);
     };
-    put(L"Enabled", g_cfg.enabled ? L"1" : L"0");
-    put(L"Sound", g_cfg.sound ? L"1" : L"0");
-    put(L"Scope", g_cfg.wholeText ? L"all" : L"word");
-    put(L"SwitchLayout", g_cfg.switchLayout ? L"1" : L"0");
-    put(L"Reselect", g_cfg.reselect ? L"1" : L"0");
-    put(L"DoubleCtrlMs", std::to_wstring(g_cfg.doubleCtrlMs));
-    put(L"MaxBuffer", std::to_wstring(g_cfg.maxBuffer));
+    put(L"Sound", L"1");
+    put(L"Scope", L"all");
+    put(L"SwitchLayout", L"1");
+    put(L"Reselect", L"1");
+    put(L"PasteMode", L"auto");
+    put(L"DoubleCtrlMs", L"500");
+    put(L"MaxBuffer", L"1000");
 }
 
 // ---------------------------------------------------------------- общее состояние
@@ -183,23 +180,25 @@ static void SendBatch(const std::vector<INPUT>& v) {
     }
 }
 
-static void SendChord(WORD mod, WORD key) {
-    std::vector<INPUT> v;
+static void AddChord(std::vector<INPUT>& v, WORD mod, WORD key) {
     v.push_back(KeyInput(mod, false));
     v.push_back(KeyInput(key, false));
     v.push_back(KeyInput(key, true));
     v.push_back(KeyInput(mod, true));
-    SendBatch(v);
 }
 
-static void SendReselect(size_t n) {
-    std::vector<INPUT> v;
+static void AddReselect(std::vector<INPUT>& v, size_t n) {
     v.push_back(KeyInput(VK_SHIFT, false));
     for (size_t i = 0; i < n; ++i) {
         v.push_back(KeyInput(VK_LEFT, false));
         v.push_back(KeyInput(VK_LEFT, true));
     }
     v.push_back(KeyInput(VK_SHIFT, true));
+}
+
+static void SendChord(WORD mod, WORD key) {
+    std::vector<INPUT> v;
+    AddChord(v, mod, key);
     SendBatch(v);
 }
 
@@ -292,6 +291,17 @@ static bool WriteClipText(const std::wstring& s) {
 }
 
 // ---------------------------------------------------------------- конвертация
+static bool UsePasteForBuffer() {
+    if (g_cfg.pasteMode == PASTE_NEVER) return false;
+    if (g_cfg.pasteMode == PASTE_ALWAYS) return true;
+    // auto: Chromium (Chrome, Edge, Opera, Electron...) и Firefox — их адресная строка
+    // обрабатывает каждый Backspace/символ по отдельности и из-за этого "печатает" медленно
+    wchar_t cls[64] = {0};
+    HWND fg = GetForegroundWindow();
+    if (fg) GetClassNameW(fg, cls, 64);
+    return wcsncmp(cls, L"Chrome_WidgetWin", 16) == 0 || wcscmp(cls, L"MozillaWindowClass") == 0;
+}
+
 static bool ConvertSelection() {
     HWND fg = GetForegroundWindow();
     wchar_t cls[64] = {0};
@@ -328,10 +338,12 @@ static bool ConvertSelection() {
     }
 
     WriteClipText(conv);
-    SendChord(VK_CONTROL, 'V');
 
     bool re = g_cfg.reselect && conv.size() <= 5000 && conv.find_first_of(L"\r\n") == std::wstring::npos;
-    if (re) SendReselect(conv.size());
+    std::vector<INPUT> in;
+    AddChord(in, VK_CONTROL, 'V');
+    if (re) AddReselect(in, conv.size());
+    SendBatch(in);
 
     Sleep(350);  // даём приложению время забрать текст из буфера
     if (saved) bak.Restore();
@@ -371,16 +383,36 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
     }
     const size_t n = snap.size() - start;
 
-    std::vector<INPUT> in;
-    for (size_t i = 0; i < n; ++i) {
-        in.push_back(KeyInput(VK_BACK, false));
-        in.push_back(KeyInput(VK_BACK, true));
+    bool done = false;
+
+    // Способ 1 (Chrome/Firefox): выделить текст и заменить одной вставкой — выглядит мгновенно
+    if (UsePasteForBuffer()) {
+        ClipBackup bak;
+        bool saved = bak.Save();
+        if (WriteClipText(newText)) {
+            std::vector<INPUT> in;
+            AddReselect(in, n);                 // Shift+Left x n (выделение набранного текста)
+            AddChord(in, VK_CONTROL, 'V');      // вставка нового текста поверх выделения
+            SendBatch(in);
+            Sleep(350);
+            done = true;
+        }
+        if (saved) bak.Restore();
     }
-    for (wchar_t ch : newText) {
-        in.push_back(UniInput(ch, false));
-        in.push_back(UniInput(ch, true));
+
+    // Способ 2 (остальные программы): Backspace x n и ввод Unicode-символов
+    if (!done) {
+        std::vector<INPUT> in;
+        for (size_t i = 0; i < n; ++i) {
+            in.push_back(KeyInput(VK_BACK, false));
+            in.push_back(KeyInput(VK_BACK, true));
+        }
+        for (wchar_t ch : newText) {
+            in.push_back(UniInput(ch, false));
+            in.push_back(UniInput(ch, true));
+        }
+        SendBatch(in);
     }
-    SendBatch(in);
 
     {
         Lock l;
@@ -456,7 +488,7 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
                 g_ctrlDownTick = k->time;
             }
         } else {
-            if (g_ctrlDown && !g_ctrlDirty && g_cfg.enabled && (k->time - g_ctrlDownTick) <= 400) {
+            if (g_ctrlDown && !g_ctrlDirty && (k->time - g_ctrlDownTick) <= 400) {
                 if (g_lastTap != 0 && (k->time - g_lastTap) <= (DWORD)g_cfg.doubleCtrlMs) {
                     g_lastTap = 0;
                     PostMessageW(g_hwnd, WM_TRIGGER, 0, 0);
@@ -476,7 +508,7 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
         g_lastTap = 0;
     }
 
-    if (!g_cfg.enabled || !down) return CallNextHookEx(NULL, code, wp, lp);
+    if (!down) return CallNextHookEx(NULL, code, wp, lp);
 
     if (g_busy) {
         if (!IsModifierVk(vk)) g_resetAfter = true;
@@ -553,7 +585,7 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
 static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
     if (code != HC_ACTION || wp == WM_MOUSEMOVE) return CallNextHookEx(NULL, code, wp, lp);
     const MSLLHOOKSTRUCT* m = (const MSLLHOOKSTRUCT*)lp;
-    if (m->dwExtraInfo == kMarker || !g_cfg.enabled || g_busy) return CallNextHookEx(NULL, code, wp, lp);
+    if (m->dwExtraInfo == kMarker || g_busy) return CallNextHookEx(NULL, code, wp, lp);
 
     switch (wp) {
         case WM_LBUTTONDOWN: {
@@ -612,107 +644,8 @@ static void PlaySwitchSound() {
     }
 }
 
-// ---------------------------------------------------------------- автозапуск
-static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-
-static bool IsAutostart() {
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
-    bool r = RegQueryValueExW(k, L"QuickGroup", NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
-    RegCloseKey(k);
-    return r;
-}
-
-static void SetAutostart(bool on) {
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
-    if (on) {
-        std::wstring v = L"\"" + g_exePath + L"\"";
-        RegSetValueExW(k, L"QuickGroup", 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
-    } else {
-        RegDeleteValueW(k, L"QuickGroup");
-    }
-    RegCloseKey(k);
-}
-
-// ---------------------------------------------------------------- трей
-static HICON MakeIcon(bool on) {
-    const int S = 32;
-    HDC sdc = GetDC(NULL);
-    HDC dc = CreateCompatibleDC(sdc);
-    HBITMAP color = CreateCompatibleBitmap(sdc, S, S);
-    HBITMAP mask = CreateBitmap(S, S, 1, 1, NULL);
-
-    HGDIOBJ old = SelectObject(dc, color);
-    HBRUSH br = CreateSolidBrush(on ? RGB(0x2B, 0x7F, 0xFF) : RGB(0x80, 0x80, 0x80));
-    RECT rc = {0, 0, S, S};
-    FillRect(dc, &rc, br);
-    DeleteObject(br);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-    HFONT font = CreateFontW(-20, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    HGDIOBJ oldFont = SelectObject(dc, font);
-    DrawTextW(dc, L"QG", -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(dc, oldFont);
-    DeleteObject(font);
-
-    SelectObject(dc, mask);
-    PatBlt(dc, 0, 0, S, S, BLACKNESS);  // маска: все пиксели непрозрачные
-    SelectObject(dc, old);
-
-    ICONINFO ii;
-    ZeroMemory(&ii, sizeof(ii));
-    ii.fIcon = TRUE;
-    ii.hbmColor = color;
-    ii.hbmMask = mask;
-    HICON ic = CreateIconIndirect(&ii);
-
-    DeleteObject(color);
-    DeleteObject(mask);
-    DeleteDC(dc);
-    ReleaseDC(NULL, sdc);
-    return ic;
-}
-
-static void TrayNotify(DWORD msg) {
-    NOTIFYICONDATAW nid;
-    ZeroMemory(&nid, sizeof(nid));
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_hwnd;
-    nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = WM_TRAY;
-    nid.hIcon = g_cfg.enabled ? g_iconOn : g_iconOff;
-    lstrcpynW(nid.szTip, g_cfg.enabled ? L"QuickGroup: двойной Ctrl — смена раскладки" : L"QuickGroup (выключен)", 128);
-    Shell_NotifyIconW(msg, &nid);
-}
-
-static void ShowMenu() {
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING | (g_cfg.enabled ? MF_CHECKED : 0), ID_ENABLE, L"Включено");
-    AppendMenuW(m, MF_STRING | (g_cfg.sound ? MF_CHECKED : 0), ID_SOUND, L"Звук");
-    AppendMenuW(m, MF_STRING | (!g_cfg.wholeText ? MF_CHECKED : 0), ID_WORD, L"Только последнее слово");
-    AppendMenuW(m, MF_STRING | (IsAutostart() ? MF_CHECKED : 0), ID_AUTOSTART, L"Автозапуск с Windows");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, ID_OPEN_INI, L"Открыть файл настроек");
-    AppendMenuW(m, MF_STRING, ID_RELOAD, L"Перечитать настройки");
-    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(m, MF_STRING, ID_EXIT, L"Выход");
-
-    POINT pt;
-    GetCursorPos(&pt);
-    SetForegroundWindow(g_hwnd);
-    TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, pt.x, pt.y, 0, g_hwnd, NULL);
-    PostMessageW(g_hwnd, WM_NULL, 0, 0);
-    DestroyMenu(m);
-}
-
+// ---------------------------------------------------------------- окно (скрытое, нужно для сообщений и буфера обмена)
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (g_taskbarCreated != 0 && m == g_taskbarCreated) {
-        TrayNotify(NIM_ADD);
-        return 0;
-    }
     switch (m) {
         case WM_TRIGGER:
             if (!g_busy.exchange(true)) {
@@ -723,41 +656,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_PLAYSOUND:
             PlaySwitchSound();
-            return 0;
-        case WM_TRAY:
-            if ((UINT)l == WM_RBUTTONUP || (UINT)l == WM_LBUTTONUP) ShowMenu();
-            return 0;
-        case WM_COMMAND:
-            switch (LOWORD(w)) {
-                case ID_ENABLE:
-                    g_cfg.enabled = !g_cfg.enabled;
-                    { Lock lk; g_buf.clear(); g_selHint = false; }
-                    SaveSettings();
-                    TrayNotify(NIM_MODIFY);
-                    break;
-                case ID_SOUND:
-                    g_cfg.sound = !g_cfg.sound;
-                    SaveSettings();
-                    break;
-                case ID_WORD:
-                    g_cfg.wholeText = !g_cfg.wholeText;
-                    SaveSettings();
-                    break;
-                case ID_AUTOSTART:
-                    SetAutostart(!IsAutostart());
-                    break;
-                case ID_OPEN_INI:
-                    if (GetFileAttributesW(g_iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) SaveSettings();
-                    ShellExecuteW(NULL, L"open", g_iniPath.c_str(), NULL, NULL, SW_SHOWNORMAL);
-                    break;
-                case ID_RELOAD:
-                    LoadSettings();
-                    TrayNotify(NIM_MODIFY);
-                    break;
-                case ID_EXIT:
-                    DestroyWindow(h);
-                    break;
-            }
             return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -772,7 +670,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     InitializeCriticalSection(&g_cs);
-    g_hInst = hInst;
 
     wchar_t path[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, path, MAX_PATH);
@@ -780,13 +677,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g_exeDir = g_exePath.substr(0, g_exePath.find_last_of(L"\\/") + 1);
     g_iniPath = g_exeDir + L"QuickGroup.ini";
 
-    if (GetFileAttributesW(g_iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) SaveSettings();
+    if (GetFileAttributesW(g_iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) SaveDefaultSettings();
     LoadSettings();
 
     g_caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
-    g_iconOn = MakeIcon(true);
-    g_iconOff = MakeIcon(false);
-    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     WNDCLASSW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -804,8 +698,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
-    TrayNotify(NIM_ADD);
-
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -814,7 +706,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     UnhookWindowsHookEx(g_kbHook);
     if (g_msHook) UnhookWindowsHookEx(g_msHook);
-    TrayNotify(NIM_DELETE);
     DeleteCriticalSection(&g_cs);
     if (mtx) CloseHandle(mtx);
     return 0;
