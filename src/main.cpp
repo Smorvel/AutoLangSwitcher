@@ -1,4 +1,4 @@
-// QuickGroup — переключение раскладки RU <-> EN двойным нажатием Ctrl
+// LangSwitch — переключение раскладки RU <-> EN двойным нажатием Ctrl
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -13,8 +13,10 @@
 #endif
 
 #include <windows.h>
+#include <objbase.h>
 #include <mmsystem.h>
 #include <process.h>
+#include <uiautomationclient.h>
 
 #include <atomic>
 #include <cstring>
@@ -26,7 +28,7 @@
 #include "layout_map.h"
 
 // ---------------------------------------------------------------- константы
-static const ULONG_PTR kMarker = 0x51474D4B;  // метка наших собственных SendInput-событий
+static const ULONG_PTR kMarker = 0x4C535743;  // метка наших собственных SendInput-событий
 static const UINT WM_TRIGGER = WM_APP + 2;
 static const UINT WM_PLAYSOUND = WM_APP + 3;
 
@@ -48,10 +50,12 @@ static HWND g_hwnd = NULL;
 static HHOOK g_kbHook = NULL, g_msHook = NULL;
 static std::wstring g_exePath, g_exeDir, g_iniPath;  // g_exeDir заканчивается на '\'
 
+static const wchar_t* kSection = L"LangSwitch";
+
 static void LoadSettings() {
     const wchar_t* ini = g_iniPath.c_str();
     auto geti = [&](const wchar_t* key, int def) {
-        return (int)GetPrivateProfileIntW(L"QuickGroup", key, def, ini);
+        return (int)GetPrivateProfileIntW(kSection, key, def, ini);
     };
     g_cfg.sound = geti(L"Sound", 1) != 0;
     g_cfg.switchLayout = geti(L"SwitchLayout", 1) != 0;
@@ -62,10 +66,10 @@ static void LoadSettings() {
     if (g_cfg.maxBuffer < 10) g_cfg.maxBuffer = 10;
 
     wchar_t buf[32] = {0};
-    GetPrivateProfileStringW(L"QuickGroup", L"Scope", L"all", buf, 32, ini);
+    GetPrivateProfileStringW(kSection, L"Scope", L"all", buf, 32, ini);
     g_cfg.wholeText = _wcsicmp(buf, L"word") != 0;
 
-    GetPrivateProfileStringW(L"QuickGroup", L"PasteMode", L"auto", buf, 32, ini);
+    GetPrivateProfileStringW(kSection, L"PasteMode", L"auto", buf, 32, ini);
     if (_wcsicmp(buf, L"never") == 0) g_cfg.pasteMode = PASTE_NEVER;
     else if (_wcsicmp(buf, L"always") == 0) g_cfg.pasteMode = PASTE_ALWAYS;
     else g_cfg.pasteMode = PASTE_AUTO;
@@ -73,8 +77,8 @@ static void LoadSettings() {
 
 static void SaveDefaultSettings() {
     const wchar_t* ini = g_iniPath.c_str();
-    auto put = [&](const wchar_t* key, const std::wstring& v) {
-        WritePrivateProfileStringW(L"QuickGroup", key, v.c_str(), ini);
+    auto put = [&](const wchar_t* key, const wchar_t* v) {
+        WritePrivateProfileStringW(kSection, key, v, ini);
     };
     put(L"Sound", L"1");
     put(L"Scope", L"all");
@@ -290,16 +294,70 @@ static bool WriteClipText(const std::wstring& s) {
     return ok;
 }
 
+// ---------------------------------------------------------------- определение адресной строки браузера
+// true, если фокус стоит в текстовом поле интерфейса браузера (адресная строка, поиск по странице),
+// а не внутри веб-страницы. Веб-страница в UI Automation всегда имеет предка типа "Document".
+// COM в потоке должен быть уже инициализирован.
+static bool FocusIsBrowserUiEdit() {
+    bool result = false;
+    IUIAutomation* uia = NULL;
+    IUIAutomationElement* focused = NULL;
+    IUIAutomationTreeWalker* walker = NULL;
+
+#ifdef _MSC_VER
+    HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), NULL, CLSCTX_INPROC_SERVER,
+                                  __uuidof(IUIAutomation), (void**)&uia);
+#else
+    HRESULT hr = CoCreateInstance(CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER,
+                                  IID_IUIAutomation, (void**)&uia);
+#endif
+
+    if (SUCCEEDED(hr) && uia && SUCCEEDED(uia->GetFocusedElement(&focused)) && focused) {
+        CONTROLTYPEID type = 0;
+        focused->get_CurrentControlType(&type);
+        if (type == UIA_EditControlTypeId || type == UIA_ComboBoxControlTypeId) {
+            if (SUCCEEDED(uia->get_ControlViewWalker(&walker)) && walker) {
+                bool inDocument = false;
+                IUIAutomationElement* cur = focused;
+                cur->AddRef();
+                for (int i = 0; i < 40 && cur; ++i) {
+                    IUIAutomationElement* parent = NULL;
+                    if (FAILED(walker->GetParentElement(cur, &parent)) || !parent) {
+                        cur->Release();
+                        cur = NULL;
+                        break;
+                    }
+                    cur->Release();
+                    cur = parent;
+                    CONTROLTYPEID pt = 0;
+                    cur->get_CurrentControlType(&pt);
+                    if (pt == UIA_DocumentControlTypeId) { inDocument = true; break; }
+                }
+                if (cur) cur->Release();
+                result = !inDocument;
+            }
+        }
+    }
+
+    if (walker) walker->Release();
+    if (focused) focused->Release();
+    if (uia) uia->Release();
+    return result;
+}
+
 // ---------------------------------------------------------------- конвертация
 static bool UsePasteForBuffer() {
     if (g_cfg.pasteMode == PASTE_NEVER) return false;
     if (g_cfg.pasteMode == PASTE_ALWAYS) return true;
-    // auto: Chromium (Chrome, Edge, Opera, Electron...) и Firefox — их адресная строка
-    // обрабатывает каждый Backspace/символ по отдельности и из-за этого "печатает" медленно
+
+    // auto: только адресная строка браузеров (Chrome, Edge, Opera, Firefox...).
+    // Её подсказки/автодополнение реагируют на каждый Backspace и символ, из-за этого текст "печатается" медленно.
     wchar_t cls[64] = {0};
     HWND fg = GetForegroundWindow();
     if (fg) GetClassNameW(fg, cls, 64);
-    return wcsncmp(cls, L"Chrome_WidgetWin", 16) == 0 || wcscmp(cls, L"MozillaWindowClass") == 0;
+    const bool browser = wcsncmp(cls, L"Chrome_WidgetWin", 16) == 0 || wcscmp(cls, L"MozillaWindowClass") == 0;
+    if (!browser) return false;
+    return FocusIsBrowserUiEdit();
 }
 
 static bool ConvertSelection() {
@@ -385,7 +443,7 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
 
     bool done = false;
 
-    // Способ 1 (Chrome/Firefox): выделить текст и заменить одной вставкой — выглядит мгновенно
+    // Способ 1 (только адресная строка браузера): выделить текст и заменить одной вставкой — выглядит мгновенно
     if (UsePasteForBuffer()) {
         ClipBackup bak;
         bool saved = bak.Save();
@@ -400,7 +458,7 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
         if (saved) bak.Restore();
     }
 
-    // Способ 2 (остальные программы): Backspace x n и ввод Unicode-символов
+    // Способ 2 (везде остальное): Backspace x n и ввод Unicode-символов
     if (!done) {
         std::vector<INPUT> in;
         for (size_t i = 0; i < n; ++i) {
@@ -434,6 +492,8 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
 }
 
 static unsigned __stdcall ConvertThread(void*) {
+    HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
     Sleep(30);  // чтобы физическое отпускание Ctrl успело обработаться
 
     bool hint;
@@ -449,6 +509,7 @@ static unsigned __stdcall ConvertThread(void*) {
     if (hint) done = ConvertSelection();
     if (!done) ConvertBuffer(snap);
 
+    if (SUCCEEDED(coHr)) CoUninitialize();
     g_busy = false;
     return 0;
 }
@@ -638,9 +699,9 @@ static void PlaySwitchSound() {
     }
     std::wstring mp3 = g_exeDir + L"switch.mp3";
     if (GetFileAttributesW(mp3.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        mciSendStringW(L"close qgsnd", NULL, 0, NULL);
-        std::wstring cmd = L"open \"" + mp3 + L"\" type mpegvideo alias qgsnd";
-        if (mciSendStringW(cmd.c_str(), NULL, 0, NULL) == 0) mciSendStringW(L"play qgsnd", NULL, 0, NULL);
+        mciSendStringW(L"close lssnd", NULL, 0, NULL);
+        std::wstring cmd = L"open \"" + mp3 + L"\" type mpegvideo alias lssnd";
+        if (mciSendStringW(cmd.c_str(), NULL, 0, NULL) == 0) mciSendStringW(L"play lssnd", NULL, 0, NULL);
     }
 }
 
@@ -666,7 +727,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 // ---------------------------------------------------------------- main
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\QuickGroup_SingleInstance");
+    HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\LangSwitch_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     InitializeCriticalSection(&g_cs);
@@ -675,7 +736,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     GetModuleFileNameW(NULL, path, MAX_PATH);
     g_exePath = path;
     g_exeDir = g_exePath.substr(0, g_exePath.find_last_of(L"\\/") + 1);
-    g_iniPath = g_exeDir + L"QuickGroup.ini";
+    g_iniPath = g_exeDir + L"LangSwitch.ini";
 
     if (GetFileAttributesW(g_iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) SaveDefaultSettings();
     LoadSettings();
@@ -686,15 +747,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ZeroMemory(&wc, sizeof(wc));
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.lpszClassName = L"QuickGroupWnd";
+    wc.lpszClassName = L"LangSwitchWnd";
     RegisterClassW(&wc);
-    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"QuickGroup", WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
+    g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"LangSwitch", WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
     if (!g_hwnd) return 1;
 
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(NULL), 0);
     g_msHook = SetWindowsHookExW(WH_MOUSE_LL, MsProc, GetModuleHandleW(NULL), 0);
     if (!g_kbHook) {
-        MessageBoxW(NULL, L"Не удалось установить перехват клавиатуры.", L"QuickGroup", MB_ICONERROR);
+        MessageBoxW(NULL, L"Не удалось установить перехват клавиатуры.", L"LangSwitch", MB_ICONERROR);
         return 1;
     }
 
