@@ -36,9 +36,12 @@
 #endif
 
 // ---------------------------------------------------------------- константы
-static const ULONG_PTR kMarker = 0x4C535743;  // метка наших собственных SendInput-событий
+static const ULONG_PTR kMarker = 0x4C535743;   // метка наших собственных SendInput-событий
 static const UINT WM_TRIGGER = WM_APP + 2;
 static const UINT WM_PLAYSOUND = WM_APP + 3;
+static const UINT_PTR kTimerChat = 1;          // проверка "открылся ли чат" после клавиши чата в игре
+static const DWORD kChatCheckMs = 250;
+static const DWORD kChatIdleMs = 4000;         // пауза в наборе, после которой чат в игре считается закрытым
 
 // ---------------------------------------------------------------- настройки
 struct Settings {
@@ -46,6 +49,7 @@ struct Settings {
     bool wholeText = true;     // false -> только последнее слово
     bool switchLayout = true;
     bool reselect = true;
+    bool gameFilter = true;    // особый режим для игр (полноэкранные окна, скрытый курсор)
     int doubleCtrlMs = 500;
     int maxBuffer = 1000;
 };
@@ -65,6 +69,7 @@ static void LoadSettings() {
     g_cfg.sound = geti(L"Sound", 1) != 0;
     g_cfg.switchLayout = geti(L"SwitchLayout", 1) != 0;
     g_cfg.reselect = geti(L"Reselect", 1) != 0;
+    g_cfg.gameFilter = geti(L"GameFilter", 1) != 0;
     g_cfg.doubleCtrlMs = geti(L"DoubleCtrlMs", 500);
     g_cfg.maxBuffer = geti(L"MaxBuffer", 1000);
     if (g_cfg.doubleCtrlMs < 100) g_cfg.doubleCtrlMs = 100;
@@ -84,6 +89,7 @@ static void SaveDefaultSettings() {
     put(L"Scope", L"all");
     put(L"SwitchLayout", L"1");
     put(L"Reselect", L"1");
+    put(L"GameFilter", L"1");
     put(L"DoubleCtrlMs", L"500");
     put(L"MaxBuffer", L"1000");
 }
@@ -104,19 +110,58 @@ struct Lock {
 static std::vector<Rec> g_buf;      // что напечатано с момента последнего "сброса"
 static bool g_selHint = false;      // есть вероятность, что в приложении что-то выделено
 static bool g_selByMouse = false;   // выделение сделано мышью
+static bool g_selForce = false;     // выделение сделано мышью при зажатом Ctrl — точно текст, проверки не нужны
 static POINT g_selDownPt = {0, 0};  // где нажата кнопка мыши при выделении
 static POINT g_selUpPt = {0, 0};    // где она отпущена
 static std::atomic<bool> g_busy(false);
 static std::atomic<bool> g_resetAfter(false);
 static std::atomic<DWORD> g_cooldownUntil(0);  // до этого момента (мс) двойной Ctrl не принимается
 
+// игровой режим
+static std::atomic<bool> g_gameArmed(false);    // в игре идёт набор текста (чат открыт)
+static std::atomic<bool> g_gamePending(false);  // нажата клавиша чата, ждём подтверждения по курсору
+static std::atomic<DWORD> g_gameLastKey(0);
+
 // состояние хуков (используется только потоком хуков)
 static bool g_caps = false, g_capsHeld = false;
 static bool g_ctrlDown = false, g_ctrlDirty = false;
+static bool g_downWithCtrl = false;
+static bool g_keyDown[256] = {false};
+static HWND g_lastFg = NULL;
 static DWORD g_ctrlDownTick = 0, g_lastTap = 0;
 static POINT g_downPt = {0, 0}, g_lastDownPt = {0, 0};
 static DWORD g_lastDownTime = 0;
 static int g_clickCount = 0;
+
+// "Взвести" набор текста в игре (чат открыт) / сбросить его
+static void GameArm(DWORD now) {
+    g_gamePending = false;
+    g_gameArmed = true;
+    g_gameLastKey = now;
+    KillTimer(g_hwnd, kTimerChat);
+    Lock l;
+    g_buf.clear();
+}
+
+static void GameDisarm() {
+    g_gameArmed = false;
+    g_gamePending = false;
+    KillTimer(g_hwnd, kTimerChat);
+    Lock l;
+    g_buf.clear();
+}
+
+// Забыть всё набранное и выделенное (например, при смене активного окна)
+static void ResetTyping() {
+    g_gameArmed = false;
+    g_gamePending = false;
+    KillTimer(g_hwnd, kTimerChat);
+    Lock l;
+    g_buf.clear();
+    g_selHint = false;
+    g_selByMouse = false;
+    g_selForce = false;
+}
 
 // ---------------------------------------------------------------- утилиты раскладок
 static HKL FgLayout() {
@@ -551,7 +596,6 @@ static FocusKind GetFocusKind() {
 // false — выделение заведомо находится не в элементе, где стоит фокус
 // (например, выделен текст ответа на странице, а фокус остался в поле ввода).
 // Для выделения мышью хотя бы одна из точек — нажатия или отпускания кнопки — должна лежать в элементе с фокусом.
-// Проверять обе точки нужно потому, что выделение можно дотянуть за границу поля.
 static bool SelectionBelongsToFocus(bool byMouse, POINT down, POINT up) {
     if (!byMouse) return true;
     bool ok = true;
@@ -570,6 +614,77 @@ static bool SelectionBelongsToFocus(bool byMouse, POINT down, POINT up) {
     return ok;
 }
 
+// ---------------------------------------------------------------- определение игры
+struct GameInfo {
+    bool game;         // активное окно — вероятно игра
+    bool cursorShown;  // системный курсор мыши виден
+};
+
+// Курсор виден? (CURSOR_SHOWING; игры, скрывающие курсор через SetCursor(NULL), тоже считаются со скрытым курсором)
+static bool CursorShown() {
+    CURSORINFO ci;
+    ZeroMemory(&ci, sizeof(ci));
+    ci.cbSize = sizeof(ci);
+    if (!GetCursorInfo(&ci)) return true;
+    return (ci.flags & CURSOR_SHOWING) != 0 && ci.hCursor != NULL;
+}
+
+// Окно на весь монитор и без заголовка (эксклюзивный или "безрамочный" полноэкранный режим)
+static bool IsFullscreenWindow(HWND fg) {
+    if (!fg) return false;
+    wchar_t cls[64] = {0};
+    GetClassNameW(fg, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") || !wcscmp(cls, L"Shell_TrayWnd") ||
+        !wcscmp(cls, L"Shell_SecondaryTrayWnd") || !wcscmp(cls, L"ConsoleWindowClass") ||
+        !wcscmp(cls, L"CASCADIA_HOSTING_WINDOW_CLASS") || IsBrowserWindow(fg))
+        return false;
+
+    const LONG_PTR style = GetWindowLongPtrW(fg, GWL_STYLE);
+    if ((style & WS_CAPTION) == WS_CAPTION) return false;  // обычное окно с заголовком (в т.ч. развёрнутое)
+
+    RECT r;
+    if (!GetWindowRect(fg, &r)) return false;
+    MONITORINFO mi;
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mi)) return false;
+    return r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right &&
+           r.bottom >= mi.rcMonitor.bottom;
+}
+
+// Курсор заперт в рамке меньше экрана (ClipCursor) — так делают игры в окне
+static bool CursorClipped() {
+    RECT c;
+    if (!GetClipCursor(&c)) return false;
+    const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    return c.left > vx || c.top > vy || c.right < vx + vw || c.bottom < vy + vh;
+}
+
+static GameInfo QueryGame(HWND fg) {
+    GameInfo gi;
+    gi.game = false;
+    gi.cursorShown = true;
+    if (!g_cfg.gameFilter) return gi;
+    gi.cursorShown = CursorShown();
+    gi.game = IsFullscreenWindow(fg) || (!gi.cursorShown && CursorClipped());
+    return gi;
+}
+
+// Клавиши, которыми в играх обычно открывают чат или консоль
+static bool IsChatTriggerVk(DWORD vk) {
+    return vk == VK_RETURN || vk == 'T' || vk == 'Y' || vk == 'U' || vk == VK_OEM_2 || vk == VK_OEM_3;
+}
+
+// В игре без открытого чата и без выделенного текста двойной Ctrl ни к чему не ведёт
+static bool GameIgnoresTrigger() {
+    if (!g_cfg.gameFilter) return false;
+    if (g_gameArmed || g_gamePending) return false;
+    if (!QueryGame(GetForegroundWindow()).game) return false;
+    Lock l;
+    return !g_selHint;
+}
+
 // ---------------------------------------------------------------- конвертация
 // Заменять текст одной вставкой нужно только в адресной строке браузера: её подсказки и автодополнение
 // реагируют на каждый Backspace и символ, из-за чего текст "печатается" по одному символу.
@@ -578,7 +693,8 @@ static bool UsePasteForBuffer() {
     return FocusIsBrowserUiEdit();
 }
 
-static bool ConvertSelection(bool byMouse, POINT down, POINT up) {
+// trusted — выделение гарантированно текст (игра или выделение с Ctrl), проверки поля ввода не нужны
+static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
     HWND fg = GetForegroundWindow();
     wchar_t cls[64] = {0};
     if (fg) GetClassNameW(fg, cls, 64);
@@ -591,7 +707,7 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up) {
     }
 
     // Выделение сделано не в том элементе, где фокус (например, текст на странице) — ничего не делаем
-    if (!SelectionBelongsToFocus(byMouse, down, up)) {
+    if (!trusted && !SelectionBelongsToFocus(byMouse, down, up)) {
         Lock l;
         g_selHint = false;
         return true;
@@ -605,7 +721,7 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up) {
     DWORD t0 = GetTickCount();
     while (GetClipboardSequenceNumber() == seq0 && GetTickCount() - t0 < 500) Sleep(10);
 
-    { Lock l; g_selHint = false; }
+    { Lock l; g_selHint = false; g_selForce = false; }
 
     if (GetClipboardSequenceNumber() == seq0) return false;  // ничего не скопировалось
 
@@ -742,31 +858,45 @@ static unsigned __stdcall ConvertThread(void*) {
 
     Sleep(30);  // чтобы физическое отпускание Ctrl успело обработаться
 
-    bool hint, byMouse;
+    bool hint, byMouse, force;
     POINT down, up;
     std::vector<Rec> snap;
     {
         Lock l;
         hint = g_selHint;
         byMouse = g_selByMouse;
+        force = g_selForce;
         down = g_selDownPt;
         up = g_selUpPt;
         snap = g_buf;
         g_resetAfter = false;
     }
 
+    // В игре набранное учитываем, только если чат открыт и набор не "протух"
+    const GameInfo gi = QueryGame(GetForegroundWindow());
+    if (gi.game) {
+        const bool active = (g_gameArmed || g_gamePending) &&
+                            (DWORD)(GetTickCount() - g_gameLastKey.load()) <= kChatIdleMs + 1000;
+        if (!active) snap.clear();
+    }
+
+    // В игре и при выделении с Ctrl проверки "это поле ввода?" не нужны
+    const bool trusted = gi.game || force;
+
     if (hint || !snap.empty()) {
-        if (GetFocusKind() == FK_NOTEXT) {
+        if (!trusted && GetFocusKind() == FK_NOTEXT) {
             // Фокус не в поле ввода — это был "ввод в никуда". Ничего не трогаем и забываем набранное.
             Lock l;
             g_buf.clear();
             g_selHint = false;
         } else {
             bool done = false;
-            if (hint) done = ConvertSelection(byMouse, down, up);
+            if (hint) done = ConvertSelection(byMouse, down, up, trusted);
             if (!done) ConvertBuffer(snap);
         }
     }
+
+    if (gi.game && (g_gameArmed || g_gamePending)) g_gameLastKey = GetTickCount();
 
     if (SUCCEEDED(coHr)) CoUninitialize();
     g_cooldownUntil = GetTickCount() + 400;  // защита от случайных повторных срабатываний
@@ -794,6 +924,13 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
     const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
     const DWORD vk = k->vkCode;
 
+    // повтор клавиши (зажата): нажатие, пока она уже считается нажатой
+    bool repeat = false;
+    if (vk < 256) {
+        if (down) { repeat = g_keyDown[vk]; g_keyDown[vk] = true; }
+        else g_keyDown[vk] = false;
+    }
+
     if (vk == VK_CAPITAL) {
         if (down) { if (!g_capsHeld) { g_capsHeld = true; g_caps = !g_caps; } }
         else g_capsHeld = false;
@@ -814,7 +951,7 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
             if (g_ctrlDown && !g_ctrlDirty && !cooling && (k->time - g_ctrlDownTick) <= 400) {
                 if (g_lastTap != 0 && (k->time - g_lastTap) <= (DWORD)g_cfg.doubleCtrlMs) {
                     g_lastTap = 0;
-                    PostMessageW(g_hwnd, WM_TRIGGER, 0, 0);
+                    if (!GameIgnoresTrigger()) PostMessageW(g_hwnd, WM_TRIGGER, 0, 0);
                 } else {
                     g_lastTap = k->time;
                 }
@@ -846,27 +983,79 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
     const bool ctrl = g_ctrlDown;
     const bool nav = (vk >= VK_PRIOR && vk <= VK_DOWN);
 
+    // Сменилось активное окно — набранное в другом окне забываем
+    HWND fg = GetForegroundWindow();
+    if (fg != g_lastFg) {
+        g_lastFg = fg;
+        ResetTyping();
+    }
+
+    // ---- игровой режим
+    const GameInfo gi = QueryGame(fg);
+    if (gi.game) {
+        const DWORD now = k->time;
+        if ((g_gameArmed || g_gamePending) && (DWORD)(now - g_gameLastKey.load()) > kChatIdleMs) GameDisarm();
+
+        if (vk == VK_ESCAPE) {  // чат закрыт
+            GameDisarm();
+            Lock l;
+            g_selHint = false;
+            g_selForce = false;
+            return CallNextHookEx(NULL, code, wp, lp);
+        }
+
+        if (!g_gameArmed && !g_gamePending) {
+            // Идёт игра. Единственное, что нас интересует, — попытка открыть чат.
+            if (IsChatTriggerVk(vk) && !repeat && !ctrl && !alt && !win) {
+                GameDisarm();
+                if (gi.cursorShown) {
+                    GameArm(now);  // курсор уже виден (меню/RTS): подтвердить по нему нельзя, считаем чат открытым
+                } else {
+                    // Курсор скрыт: если клавиша открыла чат, курсор появится. Пока ждём, ввод запоминаем условно.
+                    g_gamePending = true;
+                    g_gameLastKey = now;
+                    SetTimer(g_hwnd, kTimerChat, kChatCheckMs, NULL);
+                }
+            }
+            return CallNextHookEx(NULL, code, wp, lp);
+        }
+
+        g_gameLastKey = now;  // чат открыт (или ждём подтверждения): продолжаем как обычный набор
+    } else if (g_gameArmed || g_gamePending) {
+        GameDisarm();
+    }
+
     // Горячие клавиши: сбрасываем буфер. Ctrl+A и Ctrl/Shift+стрелки — вероятное выделение.
     if (ctrl || alt || win) {
         Lock l;
         g_buf.clear();
         g_selHint = ctrl && !alt && !win && (vk == 'A' || (shift && nav));
         g_selByMouse = false;
+        g_selForce = false;
         return CallNextHookEx(NULL, code, wp, lp);
     }
 
     if (vk == VK_BACK) {
         Lock l;
-        if (g_selHint) { g_buf.clear(); g_selHint = false; }
+        if (g_selHint) { g_buf.clear(); g_selHint = false; g_selForce = false; }
         else if (!g_buf.empty()) g_buf.pop_back();
         return CallNextHookEx(NULL, code, wp, lp);
     }
 
-    if (vk == VK_RETURN || vk == VK_TAB || vk == VK_ESCAPE || vk == VK_DELETE || vk == VK_INSERT ||
-        (vk >= VK_F1 && vk <= VK_F24)) {
+    if (vk == VK_RETURN) {
+        if (gi.game) GameDisarm();  // сообщение отправлено — чат закрыт
         Lock l;
         g_buf.clear();
         g_selHint = false;
+        g_selForce = false;
+        return CallNextHookEx(NULL, code, wp, lp);
+    }
+
+    if (vk == VK_TAB || vk == VK_ESCAPE || vk == VK_DELETE || vk == VK_INSERT || (vk >= VK_F1 && vk <= VK_F24)) {
+        Lock l;
+        g_buf.clear();
+        g_selHint = false;
+        g_selForce = false;
         return CallNextHookEx(NULL, code, wp, lp);
     }
 
@@ -875,6 +1064,7 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
         g_buf.clear();
         g_selHint = shift;
         g_selByMouse = false;
+        g_selForce = false;
         return CallNextHookEx(NULL, code, wp, lp);
     }
 
@@ -893,8 +1083,22 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
     const bool isEn = (lang == LANG_ENGLISH);
 
     Lock l;
-    if (g_selHint) { g_buf.clear(); g_selHint = false; }  // набор заменил выделенный текст
+    if (g_selHint) { g_buf.clear(); g_selHint = false; g_selForce = false; }  // набор заменил выделенный текст
     if (!isRu && !isEn) { g_buf.clear(); return CallNextHookEx(NULL, code, wp, lp); }
+
+    if (gi.game) {
+        // В игре зажатая клавиша или серия одинаковых символов (wwww) — это управление, а не текст
+        const size_t sz = g_buf.size();
+        const bool series = sz >= 3 && g_buf[sz - 1].ch == out[0] && g_buf[sz - 2].ch == out[0] &&
+                            g_buf[sz - 3].ch == out[0];
+        if (repeat || series) {
+            g_buf.clear();
+            g_gameArmed = false;
+            g_gamePending = false;
+            KillTimer(g_hwnd, kTimerChat);
+            return CallNextHookEx(NULL, code, wp, lp);
+        }
+    }
 
     Rec r;
     r.ch = out[0];
@@ -917,6 +1121,7 @@ static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
             if (g_ctrlDown) g_ctrlDirty = true;
             g_lastTap = 0;
             g_downPt = m->pt;
+            g_downWithCtrl = g_ctrlDown;
             const int dx = abs(m->pt.x - g_lastDownPt.x), dy = abs(m->pt.y - g_lastDownPt.y);
             if (g_lastDownTime != 0 && (m->time - g_lastDownTime) <= GetDoubleClickTime() &&
                 dx <= GetSystemMetrics(SM_CXDOUBLECLK) && dy <= GetSystemMetrics(SM_CYDOUBLECLK))
@@ -928,15 +1133,29 @@ static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
             Lock l;
             g_buf.clear();
             g_selHint = false;
+            g_selForce = false;
             break;
         }
         case WM_LBUTTONUP: {
             const bool drag = abs(m->pt.x - g_downPt.x) > 3 || abs(m->pt.y - g_downPt.y) > 3;
             const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            if (drag || g_clickCount >= 2 || shift) {
+            // выделение при зажатом Ctrl — гарантированно текст
+            const bool force = g_downWithCtrl && (drag || g_clickCount >= 2);
+
+            HWND fg = GetForegroundWindow();
+            g_lastFg = fg;
+
+            const GameInfo gi = QueryGame(fg);
+            if (gi.game) {
+                if (!gi.cursorShown) break;  // курсор скрыт — это управление камерой, а не выделение текста
+                GameArm(m->time);            // курсор виден: клик мог открыть чат (или выбрать поле ввода)
+            }
+
+            if (drag || g_clickCount >= 2 || shift || force) {
                 Lock l;
                 g_selHint = true;
                 g_selByMouse = true;
+                g_selForce = force;
                 g_selDownPt = g_downPt;
                 g_selUpPt = m->pt;
             }
@@ -950,6 +1169,7 @@ static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
             Lock l;
             g_buf.clear();
             g_selHint = false;
+            g_selForce = false;
             break;
         }
     }
@@ -974,7 +1194,7 @@ static void PlaySwitchSound() {
     if (GetFileAttributesW(mp3.c_str()) != INVALID_FILE_ATTRIBUTES) PlayMp3(mp3);
 }
 
-// ---------------------------------------------------------------- окно (скрытое, нужно для сообщений и буфера обмена)
+// ---------------------------------------------------------------- окно (скрытое, нужно для сообщений, таймера и буфера обмена)
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_TRIGGER:
@@ -987,6 +1207,23 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_PLAYSOUND:
             PlaySwitchSound();
             return 0;
+        case WM_TIMER:
+            if (w == kTimerChat) {
+                // После клавиши чата в игре: курсор появился — чат открылся, иначе это был промах
+                KillTimer(h, kTimerChat);
+                if (g_gamePending) {
+                    g_gamePending = false;
+                    if (CursorShown()) {
+                        g_gameArmed = true;
+                        g_gameLastKey = GetTickCount();
+                    } else {
+                        Lock lk;
+                        g_buf.clear();
+                    }
+                }
+                return 0;
+            }
+            break;
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
@@ -1005,7 +1242,16 @@ static void EnableDpiAwareness() {
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\LangSwitch_SingleInstance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // Программа уже работает: предлагаем её остановить
+        if (MessageBoxW(NULL, L"Вы хотите остановить работу LangSwitch?", L"LangSwitch",
+                        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES) {
+            HWND running = FindWindowW(L"LangSwitchWnd", NULL);
+            if (running) PostMessageW(running, WM_CLOSE, 0, 0);
+        }
+        if (mtx) CloseHandle(mtx);
+        return 0;
+    }
 
     EnableDpiAwareness();
     InitializeCriticalSection(&g_cs);
