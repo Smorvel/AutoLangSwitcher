@@ -14,13 +14,12 @@
 
 #include <windows.h>
 #include <objbase.h>
+#include <oleauto.h>
 #include <mmsystem.h>
 #include <process.h>
 #include <uiautomationclient.h>
 
 #include <atomic>
-#include <cstdarg>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -30,12 +29,16 @@
 
 #include "layout_map.h"
 
+#ifdef _MSC_VER
+#define LS_IID(T) __uuidof(T)
+#else
+#define LS_IID(T) IID_##T
+#endif
+
 // ---------------------------------------------------------------- константы
 static const ULONG_PTR kMarker = 0x4C535743;  // метка наших собственных SendInput-событий
 static const UINT WM_TRIGGER = WM_APP + 2;
 static const UINT WM_PLAYSOUND = WM_APP + 3;
-
-enum PasteMode { PASTE_NEVER = 0, PASTE_AUTO = 1, PASTE_ALWAYS = 2 };
 
 // ---------------------------------------------------------------- настройки
 struct Settings {
@@ -43,8 +46,6 @@ struct Settings {
     bool wholeText = true;     // false -> только последнее слово
     bool switchLayout = true;
     bool reselect = true;
-    bool debug = false;        // писать журнал LangSwitch.log (без набранного текста)
-    int pasteMode = PASTE_AUTO;
     int doubleCtrlMs = 500;
     int maxBuffer = 1000;
 };
@@ -52,7 +53,7 @@ struct Settings {
 static Settings g_cfg;
 static HWND g_hwnd = NULL;
 static HHOOK g_kbHook = NULL, g_msHook = NULL;
-static std::wstring g_exePath, g_exeDir, g_iniPath;  // g_exeDir заканчивается на '\'
+static std::wstring g_exeDir, g_iniPath;  // g_exeDir заканчивается на '\'
 
 static const wchar_t* kSection = L"LangSwitch";
 
@@ -64,7 +65,6 @@ static void LoadSettings() {
     g_cfg.sound = geti(L"Sound", 1) != 0;
     g_cfg.switchLayout = geti(L"SwitchLayout", 1) != 0;
     g_cfg.reselect = geti(L"Reselect", 1) != 0;
-    g_cfg.debug = geti(L"Debug", 0) != 0;
     g_cfg.doubleCtrlMs = geti(L"DoubleCtrlMs", 500);
     g_cfg.maxBuffer = geti(L"MaxBuffer", 1000);
     if (g_cfg.doubleCtrlMs < 100) g_cfg.doubleCtrlMs = 100;
@@ -73,11 +73,6 @@ static void LoadSettings() {
     wchar_t buf[32] = {0};
     GetPrivateProfileStringW(kSection, L"Scope", L"all", buf, 32, ini);
     g_cfg.wholeText = _wcsicmp(buf, L"word") != 0;
-
-    GetPrivateProfileStringW(kSection, L"PasteMode", L"auto", buf, 32, ini);
-    if (_wcsicmp(buf, L"never") == 0) g_cfg.pasteMode = PASTE_NEVER;
-    else if (_wcsicmp(buf, L"always") == 0) g_cfg.pasteMode = PASTE_ALWAYS;
-    else g_cfg.pasteMode = PASTE_AUTO;
 }
 
 static void SaveDefaultSettings() {
@@ -89,41 +84,8 @@ static void SaveDefaultSettings() {
     put(L"Scope", L"all");
     put(L"SwitchLayout", L"1");
     put(L"Reselect", L"1");
-    put(L"PasteMode", L"auto");
     put(L"DoubleCtrlMs", L"500");
     put(L"MaxBuffer", L"1000");
-    put(L"Debug", L"0");
-}
-
-// ---------------------------------------------------------------- журнал (только при Debug=1)
-// В журнал попадают только служебные сведения (классы окон, длины, шаги). Набранный текст не записывается.
-static void Log(const wchar_t* fmt, ...) {
-    if (!g_cfg.debug) return;
-    wchar_t msg[512];
-    va_list ap;
-    va_start(ap, fmt);
-    _vsnwprintf(msg, 511, fmt, ap);
-    va_end(ap);
-    msg[511] = 0;
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t line[700];
-    _snwprintf(line, 699, L"%02d:%02d:%02d.%03d [t%lu] %ls\r\n", (int)st.wHour, (int)st.wMinute, (int)st.wSecond,
-               (int)st.wMilliseconds, (unsigned long)GetCurrentThreadId(), msg);
-    line[699] = 0;
-
-    std::wstring path = g_exeDir + L"LangSwitch.log";
-    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    char u8[2100];
-    int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, u8, (int)sizeof(u8), NULL, NULL);
-    if (n > 1) {
-        DWORD written = 0;
-        WriteFile(h, u8, (DWORD)(n - 1), &written, NULL);
-    }
-    CloseHandle(h);
 }
 
 // ---------------------------------------------------------------- общее состояние
@@ -142,7 +104,8 @@ struct Lock {
 static std::vector<Rec> g_buf;      // что напечатано с момента последнего "сброса"
 static bool g_selHint = false;      // есть вероятность, что в приложении что-то выделено
 static bool g_selByMouse = false;   // выделение сделано мышью
-static POINT g_selPt = {0, 0};      // где отпущена кнопка мыши при выделении
+static POINT g_selDownPt = {0, 0};  // где нажата кнопка мыши при выделении
+static POINT g_selUpPt = {0, 0};    // где она отпущена
 static std::atomic<bool> g_busy(false);
 static std::atomic<bool> g_resetAfter(false);
 static std::atomic<DWORD> g_cooldownUntil(0);  // до этого момента (мс) двойной Ctrl не принимается
@@ -166,22 +129,16 @@ static WORD PrimaryLang(HKL h) { return PRIMARYLANGID(LOWORD((UINT_PTR)h)); }
 
 static bool IsRuLayoutNow() { return PrimaryLang(FgLayout()) == LANG_RUSSIAN; }
 
-static HKL FindLayout(bool ru) {
+static bool LayoutInstalled(bool ru) {
     const WORD want = ru ? LANG_RUSSIAN : LANG_ENGLISH;
-    const WORD preferred = ru ? 0x0419 : 0x0409;
     int n = GetKeyboardLayoutList(0, NULL);
-    if (n <= 0) return NULL;
+    if (n <= 0) return false;
     std::vector<HKL> v(n);
     GetKeyboardLayoutList(n, v.data());
-    HKL found = NULL;
     for (HKL h : v) {
-        WORD lid = LOWORD((UINT_PTR)h);
-        if (PRIMARYLANGID(lid) == want) {
-            if (lid == preferred) return h;
-            if (!found) found = h;
-        }
+        if (PrimaryLang(h) == want) return true;
     }
-    return found;
+    return false;
 }
 
 // ---------------------------------------------------------------- SendInput
@@ -239,8 +196,7 @@ static void SendChord(WORD mod, WORD key) {
 }
 
 // ---------------------------------------------------------------- переключение раскладки
-// Эмуляция системной горячей клавиши смены раскладки (Alt+Shift / Ctrl+Shift / `),
-// то есть то же самое, что нажать её руками. Сообщения WM_INPUTLANGCHANGEREQUEST не используются.
+// Эмуляция системной горячей клавиши смены раскладки (Alt+Shift / Ctrl+Shift / `)
 
 // Тип горячей клавиши из настроек Windows: 1 = Alt+Shift, 2 = Ctrl+Shift, 3 = отключена, 4 = клавиша ` (Ё)
 static int ReadSystemHotkeyType() {
@@ -297,9 +253,8 @@ static bool WaitForLayout(WORD wantLang, DWORD ms) {
 static void SwitchLayoutTo(bool ru) {
     if (!g_cfg.switchLayout) return;
     const WORD want = ru ? LANG_RUSSIAN : LANG_ENGLISH;
-    Log(L"LAYOUT want=%ls current=0x%04X", ru ? L"RU" : L"EN", (unsigned)LOWORD((UINT_PTR)FgLayout()));
     if (PrimaryLang(FgLayout()) == want) return;
-    if (!FindLayout(ru)) return;  // нужная раскладка не установлена
+    if (!LayoutInstalled(ru)) return;
 
     // Нажимаем горячую клавишу, пока не получим нужную раскладку (при 3+ раскладках они идут по кругу)
     int n = GetKeyboardLayoutList(0, NULL);
@@ -307,10 +262,8 @@ static void SwitchLayoutTo(bool ru) {
     if (n > 8) n = 8;
     for (int i = 0; i < n; ++i) {
         if (PrimaryLang(FgLayout()) == want) return;
-        if (!SendLayoutHotkey()) { Log(L"LAYOUT hotkey disabled in Windows"); return; }
-        bool ok = WaitForLayout(want, 200);
-        Log(L"LAYOUT hotkey press #%d -> %ls", i + 1, ok ? L"switched" : L"not switched (yet)");
-        if (ok) return;
+        if (!SendLayoutHotkey()) return;
+        if (WaitForLayout(want, 200)) return;
     }
 }
 
@@ -403,12 +356,6 @@ static bool WriteClipText(const std::wstring& s) {
 }
 
 // ---------------------------------------------------------------- UI Automation: что сейчас в фокусе
-#ifdef _MSC_VER
-#define LS_IID_VALUEPATTERN __uuidof(IUIAutomationValuePattern)
-#else
-#define LS_IID_VALUEPATTERN IID_IUIAutomationValuePattern
-#endif
-
 static bool CreateUia(IUIAutomation** out) {
 #ifdef _MSC_VER
     HRESULT hr = CoCreateInstance(__uuidof(CUIAutomation), NULL, CLSCTX_INPROC_SERVER,
@@ -426,9 +373,103 @@ static bool IsBrowserWindow(HWND fg) {
     return wcsncmp(cls, L"Chrome_WidgetWin", 16) == 0 || wcscmp(cls, L"MozillaWindowClass") == 0;
 }
 
+// Элементы, в которые заведомо нельзя вводить текст
+static bool IsNonTextControl(CONTROLTYPEID type) {
+    switch (type) {
+        case UIA_ButtonControlTypeId:
+        case UIA_CheckBoxControlTypeId:
+        case UIA_RadioButtonControlTypeId:
+        case UIA_HyperlinkControlTypeId:
+        case UIA_ImageControlTypeId:
+        case UIA_ListControlTypeId:
+        case UIA_ListItemControlTypeId:
+        case UIA_MenuControlTypeId:
+        case UIA_MenuBarControlTypeId:
+        case UIA_MenuItemControlTypeId:
+        case UIA_ProgressBarControlTypeId:
+        case UIA_ScrollBarControlTypeId:
+        case UIA_SliderControlTypeId:
+        case UIA_StatusBarControlTypeId:
+        case UIA_TabControlTypeId:
+        case UIA_TabItemControlTypeId:
+        case UIA_TextControlTypeId:
+        case UIA_ToolBarControlTypeId:
+        case UIA_ToolTipControlTypeId:
+        case UIA_TreeControlTypeId:
+        case UIA_TreeItemControlTypeId:
+        case UIA_TitleBarControlTypeId:
+        case UIA_SeparatorControlTypeId:
+        case UIA_ThumbControlTypeId:
+        case UIA_HeaderControlTypeId:
+        case UIA_HeaderItemControlTypeId:
+        case UIA_SplitButtonControlTypeId:
+        case UIA_DataItemControlTypeId:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// 1 — значение можно менять, 0 — только чтение, -1 — у элемента нет значения
+static int ValuePatternState(IUIAutomationElement* el) {
+    int state = -1;
+    IUnknown* unk = NULL;
+    if (SUCCEEDED(el->GetCurrentPattern(UIA_ValuePatternId, &unk)) && unk) {
+        IUIAutomationValuePattern* vp = NULL;
+        if (SUCCEEDED(unk->QueryInterface(LS_IID(IUIAutomationValuePattern), (void**)&vp)) && vp) {
+            BOOL ro = FALSE;
+            if (SUCCEEDED(vp->get_CurrentIsReadOnly(&ro))) state = ro ? 0 : 1;
+            vp->Release();
+        }
+        unk->Release();
+    }
+    return state;
+}
+
+// ARIA-роль textbox / searchbox / combobox (поля ввода, сделанные из div)
+static bool HasTextAriaRole(IUIAutomationElement* el) {
+    bool result = false;
+    BSTR role = NULL;
+    if (SUCCEEDED(el->get_CurrentAriaRole(&role)) && role) {
+        result = wcsstr(role, L"textbox") || wcsstr(role, L"searchbox") || wcsstr(role, L"combobox");
+        SysFreeString(role);
+    }
+    return result;
+}
+
+// Выделение/курсор внутри элемента помечены как редактируемые (contenteditable и подобное)
+static bool TextRangeIsEditable(IUIAutomationElement* el) {
+    bool editable = false;
+    IUnknown* unk = NULL;
+    if (SUCCEEDED(el->GetCurrentPattern(UIA_TextPatternId, &unk)) && unk) {
+        IUIAutomationTextPattern* tp = NULL;
+        if (SUCCEEDED(unk->QueryInterface(LS_IID(IUIAutomationTextPattern), (void**)&tp)) && tp) {
+            IUIAutomationTextRangeArray* arr = NULL;
+            if (SUCCEEDED(tp->GetSelection(&arr)) && arr) {
+                int len = 0;
+                arr->get_Length(&len);
+                if (len > 0) {
+                    IUIAutomationTextRange* range = NULL;
+                    if (SUCCEEDED(arr->GetElement(0, &range)) && range) {
+                        VARIANT v;
+                        VariantInit(&v);
+                        if (SUCCEEDED(range->GetAttributeValue(UIA_IsReadOnlyAttributeId, &v)) && v.vt == VT_BOOL)
+                            editable = (v.boolVal == VARIANT_FALSE);
+                        VariantClear(&v);
+                        range->Release();
+                    }
+                }
+                arr->Release();
+            }
+            tp->Release();
+        }
+        unk->Release();
+    }
+    return editable;
+}
+
 // true, если фокус стоит в текстовом поле интерфейса браузера (адресная строка, поиск по странице),
 // а не внутри веб-страницы. Веб-страница в UI Automation всегда имеет предка типа "Document".
-// COM в потоке должен быть уже инициализирован.
 static bool FocusIsBrowserUiEdit() {
     bool result = false;
     IUIAutomation* uia = NULL;
@@ -471,87 +512,35 @@ static bool FocusIsBrowserUiEdit() {
 enum FocusKind { FK_UNKNOWN = 0, FK_TEXT = 1, FK_NOTEXT = 2 };
 
 // Определяем, находится ли фокус в поле ввода текста.
-// FK_NOTEXT возвращается только когда мы уверены, что это НЕ поле ввода
-// (кнопка, список, значок, меню, страница браузера без поля и т.п.).
-// Если приложение не сообщает ничего определённого — FK_UNKNOWN (работаем как обычно).
+// FK_NOTEXT — уверены, что это НЕ поле ввода (кнопка, список, значок, страница браузера и т.п.).
+// FK_UNKNOWN — приложение ничего определённого не сообщает (работаем как обычно).
 static FocusKind GetFocusKind() {
     FocusKind result = FK_UNKNOWN;
     IUIAutomation* uia = NULL;
     IUIAutomationElement* el = NULL;
 
     if (CreateUia(&uia) && SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
+        const bool browser = IsBrowserWindow(GetForegroundWindow());
         CONTROLTYPEID type = 0;
         el->get_CurrentControlType(&type);
 
-        switch (type) {
-            case UIA_ButtonControlTypeId:
-            case UIA_CheckBoxControlTypeId:
-            case UIA_RadioButtonControlTypeId:
-            case UIA_HyperlinkControlTypeId:
-            case UIA_ImageControlTypeId:
-            case UIA_ListControlTypeId:
-            case UIA_ListItemControlTypeId:
-            case UIA_MenuControlTypeId:
-            case UIA_MenuBarControlTypeId:
-            case UIA_MenuItemControlTypeId:
-            case UIA_ProgressBarControlTypeId:
-            case UIA_ScrollBarControlTypeId:
-            case UIA_SliderControlTypeId:
-            case UIA_StatusBarControlTypeId:
-            case UIA_TabControlTypeId:
-            case UIA_TabItemControlTypeId:
-            case UIA_TextControlTypeId:
-            case UIA_ToolBarControlTypeId:
-            case UIA_ToolTipControlTypeId:
-            case UIA_TreeControlTypeId:
-            case UIA_TreeItemControlTypeId:
-            case UIA_TitleBarControlTypeId:
-            case UIA_SeparatorControlTypeId:
-            case UIA_ThumbControlTypeId:
-            case UIA_HeaderControlTypeId:
-            case UIA_HeaderItemControlTypeId:
-            case UIA_SplitButtonControlTypeId:
-            case UIA_DataItemControlTypeId:
-                result = FK_NOTEXT;
-                break;
-            default:
-                break;
-        }
-
-        const bool browser = IsBrowserWindow(GetForegroundWindow());
-
-        if (result == FK_UNKNOWN) {
-            // Если у элемента есть значение, смотрим, можно ли его менять
-            IUnknown* unk = NULL;
-            if (SUCCEEDED(el->GetCurrentPattern(UIA_ValuePatternId, &unk)) && unk) {
-                IUIAutomationValuePattern* vp = NULL;
-                if (SUCCEEDED(unk->QueryInterface(LS_IID_VALUEPATTERN, (void**)&vp)) && vp) {
-                    BOOL ro = FALSE;
-                    if (SUCCEEDED(vp->get_CurrentIsReadOnly(&ro))) result = ro ? FK_NOTEXT : FK_TEXT;
-                    vp->Release();
-                }
-                unk->Release();
+        if (IsNonTextControl(type)) {
+            result = FK_NOTEXT;
+        } else {
+            const int value = ValuePatternState(el);
+            if (value == 1) result = FK_TEXT;
+            else if (value == 0) result = FK_NOTEXT;
+            else if (type == UIA_EditControlTypeId) result = FK_TEXT;
+            else if (browser) {
+                // В браузере поле ввода — это Edit/ComboBox, элемент с ролью textbox
+                // или редактируемый блок (div с contenteditable). Всё остальное — страница.
+                const bool text = type == UIA_ComboBoxControlTypeId || HasTextAriaRole(el) || TextRangeIsEditable(el);
+                result = text ? FK_TEXT : FK_NOTEXT;
             }
-            if (type == UIA_DocumentControlTypeId) {
-                if (browser) {
-                    // Фокус на самой веб-странице (не в поле ввода) — это не ввод текста
-                    if (result != FK_TEXT) result = FK_NOTEXT;
-                } else if (result == FK_NOTEXT) {
-                    // В Word и подобных программах документ может некорректно сообщать себя read-only
-                    result = FK_UNKNOWN;
-                }
-            }
+
+            // В Word и подобных программах документ может некорректно сообщать себя read-only
+            if (!browser && type == UIA_DocumentControlTypeId && result == FK_NOTEXT) result = FK_UNKNOWN;
         }
-
-        if (result == FK_UNKNOWN && type == UIA_EditControlTypeId) result = FK_TEXT;
-
-        // В браузерах настоящее поле ввода сообщает себя как Edit или ComboBox.
-        // Всё остальное (группы, области страницы и т.п.) — это не ввод текста.
-        if (result == FK_UNKNOWN && browser && type != UIA_ComboBoxControlTypeId) result = FK_NOTEXT;
-
-        Log(L"FOCUS controlType=%d kind=%d browser=%d", (int)type, (int)result, browser ? 1 : 0);
-    } else {
-        Log(L"FOCUS: UIA gave no focused element");
     }
 
     if (el) el->Release();
@@ -561,8 +550,9 @@ static FocusKind GetFocusKind() {
 
 // false — выделение заведомо находится не в элементе, где стоит фокус
 // (например, выделен текст ответа на странице, а фокус остался в поле ввода).
-// Проверяем только выделения, сделанные мышью: точка отпускания кнопки должна лежать внутри элемента с фокусом.
-static bool SelectionBelongsToFocus(bool byMouse, POINT pt) {
+// Для выделения мышью хотя бы одна из точек — нажатия или отпускания кнопки — должна лежать в элементе с фокусом.
+// Проверять обе точки нужно потому, что выделение можно дотянуть за границу поля.
+static bool SelectionBelongsToFocus(bool byMouse, POINT down, POINT up) {
     if (!byMouse) return true;
     bool ok = true;
     IUIAutomation* uia = NULL;
@@ -571,11 +561,8 @@ static bool SelectionBelongsToFocus(bool byMouse, POINT pt) {
         RECT r;
         ZeroMemory(&r, sizeof(r));
         if (SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && r.right > r.left && r.bottom > r.top) {
-            RECT rr = r;
-            InflateRect(&rr, 6, 6);
-            ok = PtInRect(&rr, pt) != FALSE;
-            Log(L"SELCHECK pt=(%ld,%ld) rect=(%ld,%ld,%ld,%ld) inside=%d", (long)pt.x, (long)pt.y, (long)r.left,
-                (long)r.top, (long)r.right, (long)r.bottom, ok ? 1 : 0);
+            InflateRect(&r, 8, 8);
+            ok = PtInRect(&r, down) || PtInRect(&r, up);
         }
     }
     if (el) el->Release();
@@ -584,21 +571,17 @@ static bool SelectionBelongsToFocus(bool byMouse, POINT pt) {
 }
 
 // ---------------------------------------------------------------- конвертация
+// Заменять текст одной вставкой нужно только в адресной строке браузера: её подсказки и автодополнение
+// реагируют на каждый Backspace и символ, из-за чего текст "печатается" по одному символу.
 static bool UsePasteForBuffer() {
-    if (g_cfg.pasteMode == PASTE_NEVER) return false;
-    if (g_cfg.pasteMode == PASTE_ALWAYS) return true;
-
-    // auto: только адресная строка браузеров (Chrome, Edge, Opera, Firefox...).
-    // Её подсказки/автодополнение реагируют на каждый Backspace и символ, из-за этого текст "печатается" медленно.
     if (!IsBrowserWindow(GetForegroundWindow())) return false;
     return FocusIsBrowserUiEdit();
 }
 
-static bool ConvertSelection(bool byMouse, POINT pt) {
+static bool ConvertSelection(bool byMouse, POINT down, POINT up) {
     HWND fg = GetForegroundWindow();
     wchar_t cls[64] = {0};
     if (fg) GetClassNameW(fg, cls, 64);
-    Log(L"SEL start class=%ls byMouse=%d", cls, byMouse ? 1 : 0);
 
     // В консолях Ctrl+C прерывает программу — там выделение не трогаем
     if (!wcscmp(cls, L"ConsoleWindowClass") || !wcscmp(cls, L"CASCADIA_HOSTING_WINDOW_CLASS")) {
@@ -608,11 +591,10 @@ static bool ConvertSelection(bool byMouse, POINT pt) {
     }
 
     // Выделение сделано не в том элементе, где фокус (например, текст на странице) — ничего не делаем
-    if (!SelectionBelongsToFocus(byMouse, pt)) {
-        Log(L"SEL abort: selection is outside the focused element");
+    if (!SelectionBelongsToFocus(byMouse, down, up)) {
         Lock l;
         g_selHint = false;
-        return true;  // "обработано": дальше ничего не конвертируем
+        return true;
     }
 
     ClipBackup bak;
@@ -625,58 +607,46 @@ static bool ConvertSelection(bool byMouse, POINT pt) {
 
     { Lock l; g_selHint = false; }
 
-    if (GetClipboardSequenceNumber() == seq0) {
-        Log(L"SEL copy: clipboard did not change (no selection?)");
-        return false;
-    }
+    if (GetClipboardSequenceNumber() == seq0) return false;  // ничего не скопировалось
 
     std::wstring text;
     if (!ReadClipText(text) || text.empty()) {
-        Log(L"SEL copy: no text on clipboard");
         if (saved) bak.Restore();
         return false;
     }
 
     std::wstring conv = lm::ConvertSelection(text, IsRuLayoutNow());
-    Log(L"SEL copied len=%u changed=%d", (unsigned)text.size(), conv != text ? 1 : 0);
     if (conv == text) {
         if (saved) bak.Restore();
         return true;
     }
 
-    // Вставка через Ctrl+V нужна только для многострочного текста (Enter мог бы отправить сообщение)
-    // и для адресной строки браузера (иначе она "печатает" по одному символу).
-    // Всё остальное заменяем обычным вводом символов поверх выделения — как при обычном наборе.
+    // Вставка через Ctrl+V нужна для многострочного текста (Enter мог бы отправить сообщение)
+    // и для адресной строки браузера. Всё остальное заменяем обычным вводом символов поверх выделения.
     bool hasCtl = false;
     for (wchar_t c : conv) {
         if (c < 0x20) { hasCtl = true; break; }
     }
-    const bool viaPaste = hasCtl || UsePasteForBuffer();
-    Log(L"SEL method=%ls", viaPaste ? L"paste" : L"type");
 
-    if (viaPaste) {
+    if (hasCtl || UsePasteForBuffer()) {
         WriteClipText(conv);
         SendChord(VK_CONTROL, 'V');
-        Log(L"SEL pasted");
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
         Sleep(350);  // даём приложению время забрать текст из буфера
         if (saved) bak.Restore();
     } else {
-        if (saved) bak.Restore();  // буфер обмена больше не нужен — возвращаем сразу
+        if (saved) bak.Restore();
         std::vector<INPUT> in;
         for (wchar_t ch : conv) {
             in.push_back(UniInput(ch, false));
             in.push_back(UniInput(ch, true));
         }
         SendBatch(in);
-        Log(L"SEL typed len=%u", (unsigned)conv.size());
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
         Sleep(40);
     }
 
-    bool re = g_cfg.reselect && conv.size() <= 5000 && !hasCtl;
-    Log(L"SEL reselect=%d (len=%u)", re ? 1 : 0, (unsigned)conv.size());
-    if (re) {
+    if (g_cfg.reselect && conv.size() <= 5000 && !hasCtl) {
         std::vector<INPUT> in;
         AddReselect(in, conv.size());
         SendBatch(in);
@@ -719,15 +689,14 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
 
     bool done = false;
 
-    // Способ 1 (только адресная строка браузера): выделить текст и заменить одной вставкой — выглядит мгновенно
+    // Адресная строка браузера: выделить набранный текст и заменить его одной вставкой
     if (UsePasteForBuffer()) {
-        Log(L"BUF path=paste n=%u", (unsigned)n);
         ClipBackup bak;
         bool saved = bak.Save();
         if (WriteClipText(newText)) {
             std::vector<INPUT> in;
-            AddReselect(in, n);                 // Shift+Left x n (выделение набранного текста)
-            AddChord(in, VK_CONTROL, 'V');      // вставка нового текста поверх выделения
+            AddReselect(in, n);
+            AddChord(in, VK_CONTROL, 'V');
             SendBatch(in);
             PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
             Sleep(350);
@@ -736,9 +705,8 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
         if (saved) bak.Restore();
     }
 
-    // Способ 2 (везде остальное): Backspace x n и ввод Unicode-символов
+    // Везде остальное: Backspace x n и ввод Unicode-символов
     if (!done) {
-        Log(L"BUF path=type n=%u", (unsigned)n);
         std::vector<INPUT> in;
         for (size_t i = 0; i < n; ++i) {
             in.push_back(KeyInput(VK_BACK, false));
@@ -775,36 +743,34 @@ static unsigned __stdcall ConvertThread(void*) {
     Sleep(30);  // чтобы физическое отпускание Ctrl успело обработаться
 
     bool hint, byMouse;
-    POINT pt;
+    POINT down, up;
     std::vector<Rec> snap;
     {
         Lock l;
         hint = g_selHint;
         byMouse = g_selByMouse;
-        pt = g_selPt;
+        down = g_selDownPt;
+        up = g_selUpPt;
         snap = g_buf;
         g_resetAfter = false;
     }
-    Log(L"THREAD start hint=%d byMouse=%d buf=%u", hint ? 1 : 0, byMouse ? 1 : 0, (unsigned)snap.size());
 
-    if (!hint && snap.empty()) {
-        Log(L"THREAD nothing to convert");
-    } else if (GetFocusKind() == FK_NOTEXT) {
-        // Фокус не в поле ввода — это был "ввод в никуда". Ничего не трогаем и забываем набранное.
-        Log(L"THREAD focus is not a text field: skipped");
-        Lock l;
-        g_buf.clear();
-        g_selHint = false;
-    } else {
-        bool done = false;
-        if (hint) done = ConvertSelection(byMouse, pt);
-        if (!done) ConvertBuffer(snap);
+    if (hint || !snap.empty()) {
+        if (GetFocusKind() == FK_NOTEXT) {
+            // Фокус не в поле ввода — это был "ввод в никуда". Ничего не трогаем и забываем набранное.
+            Lock l;
+            g_buf.clear();
+            g_selHint = false;
+        } else {
+            bool done = false;
+            if (hint) done = ConvertSelection(byMouse, down, up);
+            if (!done) ConvertBuffer(snap);
+        }
     }
 
     if (SUCCEEDED(coHr)) CoUninitialize();
     g_cooldownUntil = GetTickCount() + 400;  // защита от случайных повторных срабатываний
     g_busy = false;
-    Log(L"THREAD end");
     return 0;
 }
 
@@ -848,14 +814,11 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
             if (g_ctrlDown && !g_ctrlDirty && !cooling && (k->time - g_ctrlDownTick) <= 400) {
                 if (g_lastTap != 0 && (k->time - g_lastTap) <= (DWORD)g_cfg.doubleCtrlMs) {
                     g_lastTap = 0;
-                    Log(L"CTRL tap #2 -> trigger");
                     PostMessageW(g_hwnd, WM_TRIGGER, 0, 0);
                 } else {
                     g_lastTap = k->time;
-                    Log(L"CTRL tap #1");
                 }
             } else {
-                if (g_ctrlDown && !g_ctrlDirty && cooling) Log(L"CTRL tap ignored (busy/cooldown)");
                 g_lastTap = 0;
             }
             g_ctrlDown = false;
@@ -974,7 +937,8 @@ static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
                 Lock l;
                 g_selHint = true;
                 g_selByMouse = true;
-                g_selPt = m->pt;
+                g_selDownPt = g_downPt;
+                g_selUpPt = m->pt;
             }
             break;
         }
@@ -993,31 +957,21 @@ static LRESULT CALLBACK MsProc(int code, WPARAM wp, LPARAM lp) {
 }
 
 // ---------------------------------------------------------------- звук
-static void PlayFileMci(const std::wstring& path, const wchar_t* type) {
+static void PlayMp3(const std::wstring& path) {
     mciSendStringW(L"close lssnd", NULL, 0, NULL);
-    std::wstring cmd = L"open \"" + path + L"\"";
-    if (type && *type) cmd += std::wstring(L" type ") + type;
-    cmd += L" alias lssnd";
-    MCIERROR e = mciSendStringW(cmd.c_str(), NULL, 0, NULL);
-    if (e == 0) e = mciSendStringW(L"play lssnd", NULL, 0, NULL);
-    Log(L"SOUND MCI result=%lu", (unsigned long)e);
+    std::wstring cmd = L"open \"" + path + L"\" type mpegvideo alias lssnd";
+    if (mciSendStringW(cmd.c_str(), NULL, 0, NULL) == 0) mciSendStringW(L"play lssnd", NULL, 0, NULL);
 }
 
 static void PlaySwitchSound() {
     if (!g_cfg.sound) return;
     std::wstring wav = g_exeDir + L"switch.wav";
     if (GetFileAttributesW(wav.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        BOOL ok = PlaySoundW(wav.c_str(), NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
-        Log(L"SOUND PlaySound ok=%d", ok ? 1 : 0);
-        if (!ok) PlayFileMci(wav, NULL);  // запасной способ, если PlaySound не смог проиграть файл
+        PlaySoundW(wav.c_str(), NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
         return;
     }
     std::wstring mp3 = g_exeDir + L"switch.mp3";
-    if (GetFileAttributesW(mp3.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        PlayFileMci(mp3, L"mpegvideo");
-        return;
-    }
-    Log(L"SOUND no sound file found");
+    if (GetFileAttributesW(mp3.c_str()) != INVALID_FILE_ATTRIBUTES) PlayMp3(mp3);
 }
 
 // ---------------------------------------------------------------- окно (скрытое, нужно для сообщений и буфера обмена)
@@ -1028,8 +982,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 uintptr_t th = _beginthreadex(NULL, 0, ConvertThread, NULL, 0, NULL);
                 if (th) CloseHandle((HANDLE)th);
                 else g_busy = false;
-            } else {
-                Log(L"TRIGGER ignored: already busy");
             }
             return 0;
         case WM_PLAYSOUND:
@@ -1043,8 +995,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 // ---------------------------------------------------------------- main
+// Чтобы координаты мыши и элементов интерфейса (UI Automation) совпадали при масштабировании экрана
 static void EnableDpiAwareness() {
-    // Чтобы координаты мыши и элементов интерфейса (UI Automation) совпадали при масштабировании экрана
     typedef BOOL(WINAPI * SetCtxFn)(HANDLE);
     HMODULE u = GetModuleHandleW(L"user32.dll");
     SetCtxFn fn = u ? (SetCtxFn)GetProcAddress(u, "SetProcessDpiAwarenessContext") : NULL;
@@ -1060,13 +1012,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     wchar_t path[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, path, MAX_PATH);
-    g_exePath = path;
-    g_exeDir = g_exePath.substr(0, g_exePath.find_last_of(L"\\/") + 1);
+    std::wstring exePath = path;
+    g_exeDir = exePath.substr(0, exePath.find_last_of(L"\\/") + 1);
     g_iniPath = g_exeDir + L"LangSwitch.ini";
 
     if (GetFileAttributesW(g_iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) SaveDefaultSettings();
     LoadSettings();
-    Log(L"=== LangSwitch started ===");
 
     g_caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
 
