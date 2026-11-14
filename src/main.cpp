@@ -518,6 +518,8 @@ static FocusKind GetFocusKind() {
                 break;
         }
 
+        const bool browser = IsBrowserWindow(GetForegroundWindow());
+
         if (result == FK_UNKNOWN) {
             // Если у элемента есть значение, смотрим, можно ли его менять
             IUnknown* unk = NULL;
@@ -531,7 +533,7 @@ static FocusKind GetFocusKind() {
                 unk->Release();
             }
             if (type == UIA_DocumentControlTypeId) {
-                if (IsBrowserWindow(GetForegroundWindow())) {
+                if (browser) {
                     // Фокус на самой веб-странице (не в поле ввода) — это не ввод текста
                     if (result != FK_TEXT) result = FK_NOTEXT;
                 } else if (result == FK_NOTEXT) {
@@ -542,7 +544,12 @@ static FocusKind GetFocusKind() {
         }
 
         if (result == FK_UNKNOWN && type == UIA_EditControlTypeId) result = FK_TEXT;
-        Log(L"FOCUS controlType=%d kind=%d", (int)type, (int)result);
+
+        // В браузерах настоящее поле ввода сообщает себя как Edit или ComboBox.
+        // Всё остальное (группы, области страницы и т.п.) — это не ввод текста.
+        if (result == FK_UNKNOWN && browser && type != UIA_ComboBoxControlTypeId) result = FK_NOTEXT;
+
+        Log(L"FOCUS controlType=%d kind=%d browser=%d", (int)type, (int)result, browser ? 1 : 0);
     } else {
         Log(L"FOCUS: UIA gave no focused element");
     }
@@ -631,24 +638,43 @@ static bool ConvertSelection(bool byMouse, POINT pt) {
     }
 
     std::wstring conv = lm::ConvertSelection(text, IsRuLayoutNow());
-    Log(L"SEL copied len=%u hasNewline=%d changed=%d", (unsigned)text.size(),
-        text.find_first_of(L"\r\n") != std::wstring::npos ? 1 : 0, conv != text ? 1 : 0);
+    Log(L"SEL copied len=%u changed=%d", (unsigned)text.size(), conv != text ? 1 : 0);
     if (conv == text) {
         if (saved) bak.Restore();
         return true;
     }
 
-    WriteClipText(conv);
-    SendChord(VK_CONTROL, 'V');
-    Log(L"SEL pasted");
-    PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
+    // Вставка через Ctrl+V нужна только для многострочного текста (Enter мог бы отправить сообщение)
+    // и для адресной строки браузера (иначе она "печатает" по одному символу).
+    // Всё остальное заменяем обычным вводом символов поверх выделения — как при обычном наборе.
+    bool hasCtl = false;
+    for (wchar_t c : conv) {
+        if (c < 0x20) { hasCtl = true; break; }
+    }
+    const bool viaPaste = hasCtl || UsePasteForBuffer();
+    Log(L"SEL method=%ls", viaPaste ? L"paste" : L"type");
 
-    // Ждём, пока приложение действительно вставит текст (Chrome обрабатывает вставку отдельно от клавиш),
-    // и только потом возвращаем буфер обмена и заново выделяем текст
-    Sleep(350);
-    if (saved) bak.Restore();
+    if (viaPaste) {
+        WriteClipText(conv);
+        SendChord(VK_CONTROL, 'V');
+        Log(L"SEL pasted");
+        PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
+        Sleep(350);  // даём приложению время забрать текст из буфера
+        if (saved) bak.Restore();
+    } else {
+        if (saved) bak.Restore();  // буфер обмена больше не нужен — возвращаем сразу
+        std::vector<INPUT> in;
+        for (wchar_t ch : conv) {
+            in.push_back(UniInput(ch, false));
+            in.push_back(UniInput(ch, true));
+        }
+        SendBatch(in);
+        Log(L"SEL typed len=%u", (unsigned)conv.size());
+        PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
+        Sleep(40);
+    }
 
-    bool re = g_cfg.reselect && conv.size() <= 5000 && conv.find_first_of(L"\r\n") == std::wstring::npos;
+    bool re = g_cfg.reselect && conv.size() <= 5000 && !hasCtl;
     Log(L"SEL reselect=%d (len=%u)", re ? 1 : 0, (unsigned)conv.size());
     if (re) {
         std::vector<INPUT> in;
@@ -982,7 +1008,7 @@ static void PlaySwitchSound() {
     std::wstring wav = g_exeDir + L"switch.wav";
     if (GetFileAttributesW(wav.c_str()) != INVALID_FILE_ATTRIBUTES) {
         BOOL ok = PlaySoundW(wav.c_str(), NULL, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
-        Log(L"SOUND PlaySound ok=%d err=%lu", ok ? 1 : 0, (unsigned long)GetLastError());
+        Log(L"SOUND PlaySound ok=%d", ok ? 1 : 0);
         if (!ok) PlayFileMci(wav, NULL);  // запасной способ, если PlaySound не смог проиграть файл
         return;
     }
