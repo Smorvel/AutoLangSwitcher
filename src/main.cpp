@@ -20,6 +20,7 @@
 #include <uiautomationclient.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
@@ -42,6 +43,7 @@ static const UINT WM_PLAYSOUND = WM_APP + 3;
 static const UINT_PTR kTimerChat = 1;          // проверка "открылся ли чат" после клавиши чата в игре
 static const DWORD kChatCheckMs = 250;
 static const DWORD kChatIdleMs = 4000;         // пауза в наборе, после которой чат в игре считается закрытым
+static const size_t kMaxUiaSelection = 5000;   // длиннее — читаем выделение обычным копированием
 
 // ---------------------------------------------------------------- настройки
 struct Settings {
@@ -58,6 +60,9 @@ static Settings g_cfg;
 static HWND g_hwnd = NULL;
 static HHOOK g_kbHook = NULL, g_msHook = NULL;
 static std::wstring g_exeDir, g_iniPath;  // g_exeDir заканчивается на '\'
+
+// форматы буфера обмена, запрещающие попадание в историю / облако / менеджеры
+static UINT g_fmtHistory = 0, g_fmtCloud = 0, g_fmtMonitor = 0;
 
 static const wchar_t* kSection = L"LangSwitch";
 
@@ -321,6 +326,25 @@ static bool OpenClip() {
     return false;
 }
 
+// Положить в (уже открытый и очищенный) буфер флаг-формат со значением 0
+static void AddFlagFormat(UINT fmt) {
+    if (!fmt) return;
+    HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+    if (!g) return;
+    DWORD* p = (DWORD*)GlobalLock(g);
+    if (!p) { GlobalFree(g); return; }
+    *p = 0;
+    GlobalUnlock(g);
+    if (!SetClipboardData(fmt, g)) GlobalFree(g);
+}
+
+// Запретить попадание содержимого буфера в историю Windows (Win+V), облачный буфер и менеджеры буфера
+static void AddHistoryExclusion(bool skipHistory, bool skipCloud, bool skipMonitor) {
+    if (!skipHistory) AddFlagFormat(g_fmtHistory);
+    if (!skipCloud) AddFlagFormat(g_fmtCloud);
+    if (!skipMonitor) AddFlagFormat(g_fmtMonitor);
+}
+
 struct ClipItem {
     UINT fmt;
     std::vector<char> data;
@@ -355,7 +379,11 @@ struct ClipBackup {
     void Restore() {
         if (!OpenClip()) return;
         EmptyClipboard();
+        bool hasHistory = false, hasCloud = false, hasMonitor = false;
         for (const ClipItem& it : items) {
+            if (it.fmt == g_fmtHistory) hasHistory = true;
+            if (it.fmt == g_fmtCloud) hasCloud = true;
+            if (it.fmt == g_fmtMonitor) hasMonitor = true;
             HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, it.data.size());
             if (!g) continue;
             void* p = GlobalLock(g);
@@ -364,24 +392,27 @@ struct ClipBackup {
             GlobalUnlock(g);
             if (!SetClipboardData(it.fmt, g)) GlobalFree(g);
         }
+        // Возврат прежнего содержимого не должен второй раз попадать в историю
+        if (!items.empty()) AddHistoryExclusion(hasHistory, hasCloud, hasMonitor);
         CloseClipboard();
     }
 };
 
-static bool ReadClipText(std::wstring& out) {
-    if (!OpenClip()) return false;
-    bool ok = false;
+// 1 — текст прочитан, 0 — в буфере нет текста, -1 — буфер сейчас занят другим приложением
+static int ReadClipText(std::wstring& out) {
+    if (!OpenClip()) return -1;
+    int result = 0;
     HANDLE h = GetClipboardData(CF_UNICODETEXT);
     if (h) {
         const wchar_t* p = (const wchar_t*)GlobalLock(h);
         if (p) {
             out = p;
             GlobalUnlock(h);
-            ok = true;
+            result = 1;
         }
     }
     CloseClipboard();
-    return ok;
+    return result;
 }
 
 static bool WriteClipText(const std::wstring& s) {
@@ -396,8 +427,36 @@ static bool WriteClipText(const std::wstring& s) {
     GlobalUnlock(g);
     bool ok = SetClipboardData(CF_UNICODETEXT, g) != NULL;
     if (!ok) GlobalFree(g);
+    else AddHistoryExclusion(false, false, false);  // временный текст не должен попасть в историю
     CloseClipboard();
     return ok;
+}
+
+// Копирует выделение через Ctrl+C. Перед копированием кладём в буфер уникальную метку:
+// выделением считается только текст, пришедший на её место. Так прежнее содержимое буфера
+// никогда не будет принято за выделение (например, если буфер менял менеджер буфера).
+static bool CopySelectionViaClipboard(std::wstring& out) {
+    wchar_t tag[64];
+    _snwprintf(tag, 63, L"__LS_%lu_%lu__", (unsigned long)GetTickCount(), (unsigned long)GetCurrentThreadId());
+    tag[63] = 0;
+    if (!WriteClipText(tag)) return false;
+
+    DWORD seq = GetClipboardSequenceNumber();
+    SendChord(VK_CONTROL, 'C');
+
+    const DWORD t0 = GetTickCount();
+    while (GetTickCount() - t0 < 600) {
+        const DWORD now = GetClipboardSequenceNumber();
+        if (now != seq) {
+            std::wstring t;
+            const int r = ReadClipText(t);
+            if (r < 0) { Sleep(10); continue; }  // буфер занят — повторим
+            if (r == 1 && !t.empty() && t != tag) { out = t; return true; }
+            seq = now;  // буфер тронул кто-то другой, а выделения в нём нет — продолжаем ждать
+        }
+        Sleep(10);
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------- UI Automation: что сейчас в фокусе
@@ -513,6 +572,48 @@ static bool TextRangeIsEditable(IUIAutomationElement* el) {
     return editable;
 }
 
+// Читает выделенный текст через UI Automation (TextPattern) — без Ctrl+C и без буфера обмена.
+// true — найдено непустое выделение разумного размера.
+static bool ReadSelectionViaUia(std::wstring& out) {
+    bool ok = false;
+    IUIAutomation* uia = NULL;
+    IUIAutomationElement* el = NULL;
+    if (CreateUia(&uia) && SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
+        IUnknown* unk = NULL;
+        if (SUCCEEDED(el->GetCurrentPattern(UIA_TextPatternId, &unk)) && unk) {
+            IUIAutomationTextPattern* tp = NULL;
+            if (SUCCEEDED(unk->QueryInterface(LS_IID(IUIAutomationTextPattern), (void**)&tp)) && tp) {
+                IUIAutomationTextRangeArray* arr = NULL;
+                if (SUCCEEDED(tp->GetSelection(&arr)) && arr) {
+                    int len = 0;
+                    arr->get_Length(&len);
+                    if (len == 1) {
+                        IUIAutomationTextRange* range = NULL;
+                        if (SUCCEEDED(arr->GetElement(0, &range)) && range) {
+                            BSTR s = NULL;
+                            if (SUCCEEDED(range->GetText((int)kMaxUiaSelection + 1, &s)) && s) {
+                                const size_t n = SysStringLen(s);
+                                if (n > 0 && n <= kMaxUiaSelection) {
+                                    out.assign(s, n);
+                                    ok = true;
+                                }
+                                SysFreeString(s);
+                            }
+                            range->Release();
+                        }
+                    }
+                    arr->Release();
+                }
+                tp->Release();
+            }
+            unk->Release();
+        }
+    }
+    if (el) el->Release();
+    if (uia) uia->Release();
+    return ok;
+}
+
 // true, если фокус стоит в текстовом поле интерфейса браузера (адресная строка, поиск по странице),
 // а не внутри веб-страницы. Веб-страница в UI Automation всегда имеет предка типа "Document".
 static bool FocusIsBrowserUiEdit() {
@@ -596,6 +697,7 @@ static FocusKind GetFocusKind() {
 // false — выделение заведомо находится не в элементе, где стоит фокус
 // (например, выделен текст ответа на странице, а фокус остался в поле ввода).
 // Для выделения мышью хотя бы одна из точек — нажатия или отпускания кнопки — должна лежать в элементе с фокусом.
+// Очень маленькие элементы (невидимые "прокси" для ввода, как в Google Docs) не проверяем.
 static bool SelectionBelongsToFocus(bool byMouse, POINT down, POINT up) {
     if (!byMouse) return true;
     bool ok = true;
@@ -604,9 +706,12 @@ static bool SelectionBelongsToFocus(bool byMouse, POINT down, POINT up) {
     if (CreateUia(&uia) && SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
         RECT r;
         ZeroMemory(&r, sizeof(r));
-        if (SUCCEEDED(el->get_CurrentBoundingRectangle(&r)) && r.right > r.left && r.bottom > r.top) {
-            InflateRect(&r, 8, 8);
-            ok = PtInRect(&r, down) || PtInRect(&r, up);
+        if (SUCCEEDED(el->get_CurrentBoundingRectangle(&r))) {
+            const LONG w = r.right - r.left, h = r.bottom - r.top;
+            if (w >= 50 && h >= 10) {
+                InflateRect(&r, 8, 8);
+                ok = PtInRect(&r, down) || PtInRect(&r, up);
+            }
         }
     }
     if (el) el->Release();
@@ -713,23 +818,24 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
         return true;
     }
 
+    // Сначала пробуем прочитать выделение через UI Automation: без Ctrl+C и без буфера обмена.
+    // Если приложение его не отдаёт — копируем через Ctrl+C.
+    std::wstring text;
     ClipBackup bak;
-    bool saved = bak.Save();
-
-    DWORD seq0 = GetClipboardSequenceNumber();
-    SendChord(VK_CONTROL, 'C');
-    DWORD t0 = GetTickCount();
-    while (GetClipboardSequenceNumber() == seq0 && GetTickCount() - t0 < 500) Sleep(10);
+    bool saved = false;
+    const bool viaUia = ReadSelectionViaUia(text);
+    if (!viaUia) {
+        saved = bak.Save();
+        if (!CopySelectionViaClipboard(text)) {
+            if (saved) bak.Restore();
+            Lock l;
+            g_selHint = false;
+            g_selForce = false;
+            return false;
+        }
+    }
 
     { Lock l; g_selHint = false; g_selForce = false; }
-
-    if (GetClipboardSequenceNumber() == seq0) return false;  // ничего не скопировалось
-
-    std::wstring text;
-    if (!ReadClipText(text) || text.empty()) {
-        if (saved) bak.Restore();
-        return false;
-    }
 
     std::wstring conv = lm::ConvertSelection(text, IsRuLayoutNow());
     if (conv == text) {
@@ -745,13 +851,14 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
     }
 
     if (hasCtl || UsePasteForBuffer()) {
+        if (!saved) saved = bak.Save();  // при чтении через UIA буфер ещё не сохранён
         WriteClipText(conv);
         SendChord(VK_CONTROL, 'V');
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
-        Sleep(350);  // даём приложению время забрать текст из буфера
+        Sleep(450);  // даём приложению время забрать текст из буфера
         if (saved) bak.Restore();
     } else {
-        if (saved) bak.Restore();
+        if (saved) bak.Restore();  // буфер обмена больше не нужен — возвращаем сразу
         std::vector<INPUT> in;
         for (wchar_t ch : conv) {
             in.push_back(UniInput(ch, false));
@@ -815,7 +922,7 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
             AddChord(in, VK_CONTROL, 'V');
             SendBatch(in);
             PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
-            Sleep(350);
+            Sleep(450);
             done = true;
         }
         if (saved) bak.Restore();
@@ -1255,6 +1362,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     EnableDpiAwareness();
     InitializeCriticalSection(&g_cs);
+
+    g_fmtHistory = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
+    g_fmtCloud = RegisterClipboardFormatW(L"CanUploadToCloudClipboard");
+    g_fmtMonitor = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
 
     wchar_t path[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, path, MAX_PATH);
