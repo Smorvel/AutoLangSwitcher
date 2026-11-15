@@ -477,15 +477,6 @@ static bool IsBrowserWindow(HWND fg) {
     return wcsncmp(cls, L"Chrome_WidgetWin", 16) == 0 || wcscmp(cls, L"MozillaWindowClass") == 0;
 }
 
-// Веб-редакторы (Google Docs) рисуют текст сами и отдают в UI Automation невидимый элемент ввода:
-// там обычные проверки "это поле ввода?" ошибаются
-static bool IsWebEditorWindow(HWND fg) {
-    if (!fg || !IsBrowserWindow(fg)) return false;
-    wchar_t title[256] = {0};
-    GetWindowTextW(fg, title, 255);
-    return wcsstr(title, L"Google Docs") || wcsstr(title, L"Google Документы");
-}
-
 // Элементы, в которые заведомо нельзя вводить текст
 static bool IsNonTextControl(CONTROLTYPEID type) {
     switch (type) {
@@ -703,29 +694,73 @@ static FocusKind GetFocusKind() {
     return result;
 }
 
-// false — выделение заведомо находится не в элементе, где стоит фокус
-// (например, выделен текст ответа на странице, а фокус остался в поле ввода).
-// Для выделения мышью хотя бы одна из точек — нажатия или отпускания кнопки — должна лежать в элементе с фокусом.
-// Очень маленькие элементы (невидимые "прокси" для ввода, как в Google Docs) не проверяем.
+// true, если в точке pt лежит обычный нередактируемый текст страницы, не относящийся к элементу focused
+static bool IsStaticTextAt(IUIAutomation* uia, IUIAutomationTreeWalker* walker, IUIAutomationElement* focused,
+                           POINT pt) {
+    bool isStatic = false;
+    IUIAutomationElement* el = NULL;
+    if (SUCCEEDED(uia->ElementFromPoint(pt, &el)) && el) {
+        CONTROLTYPEID type = 0;
+        el->get_CurrentControlType(&type);
+        if (IsNonTextControl(type)) {
+            isStatic = true;
+            IUIAutomationElement* cur = el;
+            cur->AddRef();
+            for (int i = 0; i < 12 && cur; ++i) {
+                // элемент внутри поля с фокусом или внутри редактируемого элемента — это не просто текст страницы
+                BOOL same = FALSE;
+                if (SUCCEEDED(uia->CompareElements(cur, focused, &same)) && same) { isStatic = false; break; }
+                if (ValuePatternState(cur) == 1 || HasTextAriaRole(cur)) { isStatic = false; break; }
+                IUIAutomationElement* parent = NULL;
+                if (FAILED(walker->GetParentElement(cur, &parent)) || !parent) {
+                    cur->Release();
+                    cur = NULL;
+                    break;
+                }
+                cur->Release();
+                cur = parent;
+            }
+            if (cur) cur->Release();
+        }
+        el->Release();
+    }
+    return isStatic;
+}
+
+// false — только если есть явное доказательство, что выделен обычный текст страницы вне поля, где стоит фокус
+// (например, выделен текст ответа в чате, а фокус остался в поле ввода).
+// Если определить нельзя (редакторы вроде Google Docs, которые рисуют текст сами и ничего не отдают
+// в UI Automation), выделение считается выделением в редакторе.
 static bool SelectionBelongsToFocus(bool byMouse, POINT down, POINT up) {
     if (!byMouse) return true;
-    bool ok = true;
+    bool belongs = true;
     IUIAutomation* uia = NULL;
-    IUIAutomationElement* el = NULL;
-    if (CreateUia(&uia) && SUCCEEDED(uia->GetFocusedElement(&el)) && el) {
+    IUIAutomationElement* focused = NULL;
+    IUIAutomationTreeWalker* walker = NULL;
+
+    if (CreateUia(&uia) && SUCCEEDED(uia->GetFocusedElement(&focused)) && focused) {
+        // нажатие или отпускание кнопки внутри элемента с фокусом — выделение в нём
+        bool inside = false;
         RECT r;
         ZeroMemory(&r, sizeof(r));
-        if (SUCCEEDED(el->get_CurrentBoundingRectangle(&r))) {
+        if (SUCCEEDED(focused->get_CurrentBoundingRectangle(&r))) {
             const LONG w = r.right - r.left, h = r.bottom - r.top;
             if (w >= 50 && h >= 10) {
                 InflateRect(&r, 8, 8);
-                ok = PtInRect(&r, down) || PtInRect(&r, up);
+                inside = PtInRect(&r, down) || PtInRect(&r, up);
             }
         }
+        // иначе отклоняем выделение, только если оба конца лежат на обычном тексте страницы
+        if (!inside && SUCCEEDED(uia->get_ControlViewWalker(&walker)) && walker) {
+            if (IsStaticTextAt(uia, walker, focused, down) && IsStaticTextAt(uia, walker, focused, up))
+                belongs = false;
+        }
     }
-    if (el) el->Release();
+
+    if (walker) walker->Release();
+    if (focused) focused->Release();
     if (uia) uia->Release();
-    return ok;
+    return belongs;
 }
 
 // ---------------------------------------------------------------- определение игры
@@ -1000,7 +1035,7 @@ static unsigned __stdcall ConvertThread(void*) {
     }
 
     // В игре и при выделении с Ctrl проверки "это поле ввода?" не нужны
-    const bool trusted = gi.game || force || IsWebEditorWindow(GetForegroundWindow());
+    const bool trusted = gi.game || force;
 
     if (hint || !snap.empty()) {
         if (!trusted && GetFocusKind() == FK_NOTEXT) {
