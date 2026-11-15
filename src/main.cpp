@@ -477,6 +477,15 @@ static bool IsBrowserWindow(HWND fg) {
     return wcsncmp(cls, L"Chrome_WidgetWin", 16) == 0 || wcscmp(cls, L"MozillaWindowClass") == 0;
 }
 
+// Веб-редакторы (Google Docs) рисуют текст сами и отдают в UI Automation невидимый элемент ввода:
+// там обычные проверки "это поле ввода?" ошибаются
+static bool IsWebEditorWindow(HWND fg) {
+    if (!fg || !IsBrowserWindow(fg)) return false;
+    wchar_t title[256] = {0};
+    GetWindowTextW(fg, title, 255);
+    return wcsstr(title, L"Google Docs") || wcsstr(title, L"Google Документы");
+}
+
 // Элементы, в которые заведомо нельзя вводить текст
 static bool IsNonTextControl(CONTROLTYPEID type) {
     switch (type) {
@@ -823,7 +832,10 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
     std::wstring text;
     ClipBackup bak;
     bool saved = false;
-    const bool viaUia = ReadSelectionViaUia(text);
+    // Текст из UIA используем, только если в нём есть что конвертировать: некоторые приложения
+    // (Google Docs) отдают через UIA пустышку вместо настоящего выделения
+    bool viaUia = ReadSelectionViaUia(text);
+    if (viaUia && lm::ConvertSelection(text, IsRuLayoutNow()) == text) viaUia = false;
     if (!viaUia) {
         saved = bak.Save();
         if (!CopySelectionViaClipboard(text)) {
@@ -988,7 +1000,7 @@ static unsigned __stdcall ConvertThread(void*) {
     }
 
     // В игре и при выделении с Ctrl проверки "это поле ввода?" не нужны
-    const bool trusted = gi.game || force;
+    const bool trusted = gi.game || force || IsWebEditorWindow(GetForegroundWindow());
 
     if (hint || !snap.empty()) {
         if (!trusted && GetFocusKind() == FK_NOTEXT) {
