@@ -122,6 +122,11 @@ static std::atomic<bool> g_busy(false);
 static std::atomic<bool> g_resetAfter(false);
 static std::atomic<DWORD> g_cooldownUntil(0);  // до этого момента (мс) двойной Ctrl не принимается
 
+// Раскладка, которую мы переключили сами в окне, не сообщающем о смене раскладки (см. EffectiveLayout)
+static std::atomic<int> g_assumedLang(0);        // LANG_RUSSIAN / LANG_ENGLISH, 0 — не используется
+static std::atomic<UINT_PTR> g_assumedHwnd(0);   // окно, для которого это действует
+static std::atomic<UINT_PTR> g_assumedStale(0);  // что окно продолжает сообщать (устаревшая раскладка)
+
 // игровой режим
 static std::atomic<bool> g_gameArmed(false);    // в игре идёт набор текста (чат открыт)
 static std::atomic<bool> g_gamePending(false);  // нажата клавиша чата, ждём подтверждения по курсору
@@ -132,6 +137,8 @@ static bool g_caps = false, g_capsHeld = false;
 static bool g_ctrlDown = false, g_ctrlDirty = false;
 static bool g_downWithCtrl = false;
 static bool g_keyDown[256] = {false};
+static int g_chordMask = 0;        // какие из Shift(1)/Alt(2)/Ctrl(4)/Win(8) нажимались с тех пор, как все были отпущены
+static bool g_chordDirty = false;  // и нажималась ли между ними обычная клавиша
 static HWND g_lastFg = NULL;
 static DWORD g_ctrlDownTick = 0, g_lastTap = 0;
 static POINT g_downPt = {0, 0}, g_lastDownPt = {0, 0};
@@ -177,19 +184,45 @@ static HKL FgLayout() {
 
 static WORD PrimaryLang(HKL h) { return PRIMARYLANGID(LOWORD((UINT_PTR)h)); }
 
-static bool IsRuLayoutNow() { return PrimaryLang(FgLayout()) == LANG_RUSSIAN; }
-
-static bool LayoutInstalled(bool ru) {
+static HKL FindLayout(bool ru) {
     const WORD want = ru ? LANG_RUSSIAN : LANG_ENGLISH;
+    const WORD preferred = ru ? 0x0419 : 0x0409;
     int n = GetKeyboardLayoutList(0, NULL);
-    if (n <= 0) return false;
+    if (n <= 0) return NULL;
     std::vector<HKL> v(n);
     GetKeyboardLayoutList(n, v.data());
+    HKL found = NULL;
     for (HKL h : v) {
-        if (PrimaryLang(h) == want) return true;
+        WORD lid = LOWORD((UINT_PTR)h);
+        if (PRIMARYLANGID(lid) == want) {
+            if (lid == preferred) return h;
+            if (!found) found = h;
+        }
     }
-    return false;
+    return found;
 }
+
+static bool LayoutInstalled(bool ru) { return FindLayout(ru) != NULL; }
+
+// Раскладка, в которой на самом деле идёт набор.
+// Обычно это то, что сообщает окно. Но некоторые приложения (например, Epic Games Launcher) не сообщают о смене
+// раскладки: после нашего переключения они продолжают называть старую. Тогда используем то, что мы переключили сами,
+// пока окно не начнёт сообщать что-то другое.
+static HKL EffectiveLayout() {
+    const HKL reported = FgLayout();
+    const int a = g_assumedLang;
+    if (a != 0) {
+        if (g_assumedHwnd == (UINT_PTR)GetForegroundWindow() && g_assumedStale == (UINT_PTR)reported) {
+            const HKL h = FindLayout(a == LANG_RUSSIAN);
+            if (h) return h;
+        } else {
+            g_assumedLang = 0;  // окно сменилось или снова сообщает актуальную раскладку — доверяем ему
+        }
+    }
+    return reported;
+}
+
+static bool IsRuLayoutNow() { return PrimaryLang(EffectiveLayout()) == LANG_RUSSIAN; }
 
 // ---------------------------------------------------------------- SendInput
 static INPUT KeyInput(WORD vk, bool up) {
@@ -212,6 +245,32 @@ static INPUT UniInput(wchar_t ch, bool up) {
     in.ki.dwFlags = KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0);
     in.ki.dwExtraInfo = kMarker;
     return in;
+}
+
+// Символ вводим как при ручном наборе: пробел — настоящей клавишей (Unicode-события с пробелом
+// некоторые приложения теряют), остальное — Unicode-событием
+static void AddTypedChar(std::vector<INPUT>& v, wchar_t ch) {
+    if (ch == L' ') {
+        v.push_back(KeyInput(VK_SPACE, false));
+        v.push_back(KeyInput(VK_SPACE, true));
+    } else {
+        v.push_back(UniInput(ch, false));
+        v.push_back(UniInput(ch, true));
+    }
+}
+
+static void AddTypedText(std::vector<INPUT>& v, const std::wstring& s) {
+    for (wchar_t ch : s) AddTypedChar(v, ch);
+}
+
+// Делит текст на пробелы в начале, середину и пробелы в конце
+static void SplitEdgeSpaces(const std::wstring& s, std::wstring& lead, std::wstring& core, std::wstring& trail) {
+    size_t b = 0, e = s.size();
+    while (b < e && s[b] == L' ') ++b;
+    while (e > b && s[e - 1] == L' ') --e;
+    lead = s.substr(0, b);
+    core = s.substr(b, e - b);
+    trail = s.substr(e);
 }
 
 static void SendBatch(const std::vector<INPUT>& v) {
@@ -304,7 +363,7 @@ static bool WaitLayoutChange(HKL before, DWORD ms) {
 static void SwitchLayoutTo(bool ru) {
     if (!g_cfg.switchLayout) return;
     const WORD want = ru ? LANG_RUSSIAN : LANG_ENGLISH;
-    if (PrimaryLang(FgLayout()) == want) return;
+    if (PrimaryLang(EffectiveLayout()) == want) return;
     if (!LayoutInstalled(ru)) return;
 
     // Нажимаем горячую клавишу и смотрим, что изменилось. Нажимать повторно можно, только если раскладка
@@ -315,9 +374,19 @@ static void SwitchLayoutTo(bool ru) {
     if (n > 8) n = 8;
     for (int i = 0; i < n; ++i) {
         const HKL before = FgLayout();
-        if (PrimaryLang(before) == want) return;
+        if (PrimaryLang(EffectiveLayout()) == want) return;
         if (!SendLayoutHotkey()) return;
-        if (!WaitLayoutChange(before, 400)) return;
+        if (!WaitLayoutChange(before, 400)) {
+            // Окно не сообщает о смене раскладки (так ведут себя некоторые приложения, например Epic Games Launcher).
+            // При двух раскладках одно нажатие горячей клавиши гарантированно включило нужную — запоминаем это,
+            // чтобы дальше не полагаться на устаревшие данные окна.
+            if (n == 2) {
+                g_assumedStale = (UINT_PTR)before;
+                g_assumedHwnd = (UINT_PTR)GetForegroundWindow();
+                g_assumedLang = (int)want;
+            }
+            return;
+        }
     }
 }
 
@@ -902,19 +971,23 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
     }
 
     if (hasCtl || UsePasteForBuffer()) {
+        // Пробелы по краям вводим клавишей: многие поля обрезают их у вставляемого текста
+        std::wstring lead, core, trail;
+        SplitEdgeSpaces(conv, lead, core, trail);
         if (!saved) saved = bak.Save();  // при чтении через UIA буфер ещё не сохранён
-        WriteClipText(conv);
-        SendChord(VK_CONTROL, 'V');
+        if (!core.empty()) WriteClipText(core);
+        std::vector<INPUT> in;
+        AddTypedText(in, lead);
+        if (!core.empty()) AddChord(in, VK_CONTROL, 'V');
+        AddTypedText(in, trail);
+        SendBatch(in);
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
         Sleep(450);  // даём приложению время забрать текст из буфера
         if (saved) bak.Restore();
     } else {
         if (saved) bak.Restore();  // буфер обмена больше не нужен — возвращаем сразу
         std::vector<INPUT> in;
-        for (wchar_t ch : conv) {
-            in.push_back(UniInput(ch, false));
-            in.push_back(UniInput(ch, true));
-        }
+        AddTypedText(in, conv);
         SendBatch(in);
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
         Sleep(40);
@@ -965,12 +1038,16 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
 
     // Адресная строка браузера: выделить набранный текст и заменить его одной вставкой
     if (UsePasteForBuffer()) {
+        std::wstring lead, core, trail;
+        SplitEdgeSpaces(newText, lead, core, trail);  // пробелы по краям вводим клавишей, их вставка может обрезаться
         ClipBackup bak;
         bool saved = bak.Save();
-        if (WriteClipText(newText)) {
+        if (core.empty() || WriteClipText(core)) {
             std::vector<INPUT> in;
             AddReselect(in, n);
-            AddChord(in, VK_CONTROL, 'V');
+            AddTypedText(in, lead);
+            if (!core.empty()) AddChord(in, VK_CONTROL, 'V');
+            AddTypedText(in, trail);
             SendBatch(in);
             PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
             Sleep(450);
@@ -979,17 +1056,14 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
         if (saved) bak.Restore();
     }
 
-    // Везде остальное: Backspace x n и ввод Unicode-символов
+    // Везде остальное: Backspace x n и ввод символов
     if (!done) {
         std::vector<INPUT> in;
         for (size_t i = 0; i < n; ++i) {
             in.push_back(KeyInput(VK_BACK, false));
             in.push_back(KeyInput(VK_BACK, true));
         }
-        for (wchar_t ch : newText) {
-            in.push_back(UniInput(ch, false));
-            in.push_back(UniInput(ch, true));
-        }
+        AddTypedText(in, newText);
         SendBatch(in);
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
     }
@@ -1074,6 +1148,47 @@ static bool IsModifierVk(DWORD vk) {
     return false;
 }
 
+// Пользователь сам переключил раскладку горячей клавишей. Если мы ведём учёт раскладки вместо окна,
+// которое о ней не сообщает, при двух раскладках она просто сменилась на другую.
+static void OnManualLayoutSwitch() {
+    const int a = g_assumedLang;
+    if (a == 0) return;
+    if (GetKeyboardLayoutList(0, NULL) == 2) g_assumedLang = (a == LANG_RUSSIAN) ? LANG_ENGLISH : LANG_RUSSIAN;
+    else g_assumedLang = 0;  // не знаем, на какую именно
+}
+
+// Отслеживаем жест смены раскладки (Alt+Shift / Ctrl+Shift по настройкам Windows, Win+Space)
+static void TrackLayoutChord(DWORD vk, bool down) {
+    int bit = 0;
+    if (vk == VK_LSHIFT || vk == VK_RSHIFT) bit = 1;
+    else if (vk == VK_LMENU || vk == VK_RMENU) bit = 2;
+    else if (vk == VK_LCONTROL || vk == VK_RCONTROL) bit = 4;
+    else if (vk == VK_LWIN || vk == VK_RWIN) bit = 8;
+
+    if (bit == 0) {  // обычная клавиша
+        if (down) {
+            if (vk == VK_SPACE && (g_keyDown[VK_LWIN] || g_keyDown[VK_RWIN])) OnManualLayoutSwitch();
+            if (g_chordMask) g_chordDirty = true;
+        }
+        return;
+    }
+    if (down) {
+        g_chordMask |= bit;
+        return;
+    }
+
+    // модификатор отпущен: жест завершён, когда отпущены все модификаторы
+    const bool anyHeld = g_keyDown[VK_LSHIFT] || g_keyDown[VK_RSHIFT] || g_keyDown[VK_LMENU] || g_keyDown[VK_RMENU] ||
+                         g_keyDown[VK_LCONTROL] || g_keyDown[VK_RCONTROL] || g_keyDown[VK_LWIN] || g_keyDown[VK_RWIN];
+    if (anyHeld) return;
+    if (!g_chordDirty && g_chordMask != 0) {
+        const int t = ReadSystemHotkeyType();
+        if ((t == 1 && g_chordMask == 3) || (t == 2 && g_chordMask == 5)) OnManualLayoutSwitch();
+    }
+    g_chordMask = 0;
+    g_chordDirty = false;
+}
+
 static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
     if (code != HC_ACTION) return CallNextHookEx(NULL, code, wp, lp);
     const KBDLLHOOKSTRUCT* k = (const KBDLLHOOKSTRUCT*)lp;
@@ -1088,6 +1203,8 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
         if (down) { repeat = g_keyDown[vk]; g_keyDown[vk] = true; }
         else g_keyDown[vk] = false;
     }
+
+    TrackLayoutChord(vk, down);
 
     if (vk == VK_CAPITAL) {
         if (down) { if (!g_capsHeld) { g_capsHeld = true; g_caps = !g_caps; } }
@@ -1227,7 +1344,7 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
     }
 
     // ---- обычная клавиша: узнаём, какой символ она даёт в текущей раскладке
-    HKL hkl = FgLayout();
+    HKL hkl = EffectiveLayout();
     BYTE ks[256];
     ZeroMemory(ks, sizeof(ks));
     if (shift) ks[VK_SHIFT] = 0x80;
