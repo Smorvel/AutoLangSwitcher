@@ -69,15 +69,31 @@ std::wstring ConvertSelection(const std::wstring& text, bool defaultIsRu) {
         if (IsCyrillic(c)) { out += RuToEn(c); continue; }
 
         if (IsAmbiguous(c)) {
-            // раскладку знака определяем по ближайшей букве: сначала слева, потом справа
+            // Раскладку знака определяем по ближайшей букве внутри того же слова (до пробела):
+            // знак, приклеенный к слову, набран в той же раскладке, что и его буквы
+            // (например, ",tp" — это "без", набранное латиницей, а не русская запятая).
+            // Если в слове букв нет — берём ближайшую букву слева, затем справа (через пробелы).
+            auto isSpace = [](wchar_t ch) { return ch == L' ' || ch == L'\t' || ch == L'\r' || ch == L'\n'; };
             bool isRu = defaultIsRu;
-            bool found = false;
-            for (size_t j = i; j-- > 0;) {
-                if (IsLetter(text[j])) { isRu = IsCyrillic(text[j]); found = true; break; }
+            size_t left = n, right = n;  // n означает "не найдено"
+            for (size_t j = i; j > 0 && !isSpace(text[j - 1]); --j) {
+                if (IsLetter(text[j - 1])) { left = j - 1; break; }
             }
-            if (!found) {
-                for (size_t j = i + 1; j < n; ++j) {
-                    if (IsLetter(text[j])) { isRu = IsCyrillic(text[j]); break; }
+            for (size_t j = i + 1; j < n && !isSpace(text[j]); ++j) {
+                if (IsLetter(text[j])) { right = j; break; }
+            }
+            if (left != n || right != n) {
+                const bool useLeft = (right == n) || (left != n && i - left <= right - i);
+                isRu = IsCyrillic(text[useLeft ? left : right]);
+            } else {
+                bool found = false;
+                for (size_t j = i; j-- > 0;) {
+                    if (IsLetter(text[j])) { isRu = IsCyrillic(text[j]); found = true; break; }
+                }
+                if (!found) {
+                    for (size_t j = i + 1; j < n; ++j) {
+                        if (IsLetter(text[j])) { isRu = IsCyrillic(text[j]); break; }
+                    }
                 }
             }
             out += isRu ? RuToEn(c) : EnToRu(c);
