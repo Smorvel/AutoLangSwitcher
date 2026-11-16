@@ -291,10 +291,11 @@ static bool SendLayoutHotkey() {
     return true;
 }
 
-static bool WaitForLayout(WORD wantLang, DWORD ms) {
+// Ждём, пока раскладка активного окна изменится (на любую). true — изменилась.
+static bool WaitLayoutChange(HKL before, DWORD ms) {
     const DWORD t0 = GetTickCount();
     for (;;) {
-        if (PrimaryLang(FgLayout()) == wantLang) return true;
+        if (FgLayout() != before) return true;
         if (GetTickCount() - t0 >= ms) return false;
         Sleep(10);
     }
@@ -306,14 +307,17 @@ static void SwitchLayoutTo(bool ru) {
     if (PrimaryLang(FgLayout()) == want) return;
     if (!LayoutInstalled(ru)) return;
 
-    // Нажимаем горячую клавишу, пока не получим нужную раскладку (при 3+ раскладках они идут по кругу)
+    // Нажимаем горячую клавишу и смотрим, что изменилось. Нажимать повторно можно, только если раскладка
+    // сменилась, но не на ту (при 3+ раскладках они идут по кругу). Если изменений не видно вообще, приложение
+    // могло просто не сообщить о смене — повторное нажатие вернуло бы раскладку обратно, поэтому останавливаемся.
     int n = GetKeyboardLayoutList(0, NULL);
     if (n < 2) return;
     if (n > 8) n = 8;
     for (int i = 0; i < n; ++i) {
-        if (PrimaryLang(FgLayout()) == want) return;
+        const HKL before = FgLayout();
+        if (PrimaryLang(before) == want) return;
         if (!SendLayoutHotkey()) return;
-        if (WaitForLayout(want, 200)) return;
+        if (!WaitLayoutChange(before, 400)) return;
     }
 }
 
