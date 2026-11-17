@@ -17,6 +17,8 @@
 #include <oleauto.h>
 #include <mmsystem.h>
 #include <process.h>
+#include <shellapi.h>
+#include <taskschd.h>
 #include <uiautomationclient.h>
 
 #include <algorithm>
@@ -34,6 +36,13 @@
 #include "layout_map.h"
 
 #ifdef _MSC_VER
+#pragma comment(lib, "taskschd.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "advapi32.lib")
+#endif
+
+#ifdef _MSC_VER
 #define LS_IID(T) __uuidof(T)
 #else
 #define LS_IID(T) IID_##T
@@ -48,6 +57,7 @@ static const DWORD kChatCheckMs = 250;
 static const DWORD kChatIdleMs = 4000;         // пауза в наборе, после которой чат в игре считается закрытым
 static const size_t kMaxUiaSelection = 5000;   // длиннее — читаем выделение обычным копированием
 static const DWORD kSelChainMs = 120000;       // сколько живёт цепочка повторных конвертаций выделения
+static const wchar_t* kMutexName = L"Local\\LangSwitch_SingleInstance";
 
 // ---------------------------------------------------------------- настройки
 struct Settings {
@@ -63,7 +73,9 @@ struct Settings {
 static Settings g_cfg;
 static HWND g_hwnd = NULL;
 static HHOOK g_kbHook = NULL, g_msHook = NULL;
-static std::wstring g_exeDir, g_iniPath;  // g_exeDir заканчивается на '\'
+static std::wstring g_exePath, g_exeDir, g_iniPath;  // g_exeDir заканчивается на '\'
+static UINT g_msgCmd = 0;                            // служебное сообщение между копиями программы
+static bool g_elevated = false;                      // эта копия запущена с правами администратора
 
 // форматы буфера обмена, запрещающие попадание в историю / облако / менеджеры
 static UINT g_fmtHistory = 0, g_fmtCloud = 0, g_fmtMonitor = 0;
@@ -1793,8 +1805,691 @@ static void PlaySwitchSound() {
     if (GetFileAttributesW(mp3.c_str()) != INVALID_FILE_ATTRIBUTES) PlayMp3(mp3);
 }
 
+// ---------------------------------------------------------------- права администратора и связь между копиями
+static const WPARAM CMD_QUIT = 1;    // работающая копия должна закрыться
+static const WPARAM CMD_QUERY = 2;   // работающая копия отвечает: 0x100 | (с правами администратора ? 1 : 0)
+
+static bool TokenIsElevated(HANDLE token) {
+    TOKEN_ELEVATION e;
+    DWORD sz = 0;
+    return GetTokenInformation(token, TokenElevation, &e, sizeof(e), &sz) && e.TokenIsElevated != 0;
+}
+
+static bool IsElevated() {
+    HANDLE t = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return false;
+    const bool r = TokenIsElevated(t);
+    CloseHandle(t);
+    return r;
+}
+
+static bool ProcessIsElevated(DWORD pid) {
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return false;
+    HANDLE t = NULL;
+    bool r = false;
+    if (OpenProcessToken(p, TOKEN_QUERY, &t)) {
+        r = TokenIsElevated(t);
+        CloseHandle(t);
+    }
+    CloseHandle(p);
+    return r;
+}
+
+static HWND FindRunning() { return FindWindowW(L"LangSwitchWnd", NULL); }
+
+// Просим работающую копию закрыться (для копии с правами администратора обычный WM_CLOSE блокируется Windows,
+// поэтому используется собственное сообщение, которое она разрешила принимать)
+static void StopRunning() {
+    HWND w = FindRunning();
+    if (!w) return;
+    DWORD_PTR r = 0;
+    SendMessageTimeoutW(w, g_msgCmd, CMD_QUIT, 0, SMTO_ABORTIFHUNG, 1500, &r);
+    PostMessageW(w, WM_CLOSE, 0, 0);  // для старых версий программы
+}
+
+static bool RunningIsElevated() {
+    HWND w = FindRunning();
+    if (!w) return false;
+    DWORD_PTR r = 0;
+    if (SendMessageTimeoutW(w, g_msgCmd, CMD_QUERY, 0, SMTO_ABORTIFHUNG, 800, &r) && (r & 0x100)) return (r & 1) != 0;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    return pid != 0 && ProcessIsElevated(pid);
+}
+
+// Запустить эту программу с правами администратора (покажет запрос UAC). wait — дождаться завершения.
+// true — программа запущена (и при wait — завершилась с кодом 0).
+static bool RunSelfElevated(const wchar_t* args, HWND owner, bool wait) {
+    SHELLEXECUTEINFOW sei;
+    ZeroMemory(&sei, sizeof(sei));
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    sei.hwnd = owner;
+    sei.lpVerb = L"runas";
+    sei.lpFile = g_exePath.c_str();
+    sei.lpParameters = args;
+    sei.lpDirectory = g_exeDir.c_str();
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei)) return false;  // в том числе, если пользователь отказался в UAC
+    if (!sei.hProcess) return true;
+    if (!wait) {
+        CloseHandle(sei.hProcess);
+        return true;
+    }
+
+    // ждём завершения, обрабатывая сообщения окна
+    bool finished = false;
+    const DWORD t0 = GetTickCount();
+    while (GetTickCount() - t0 < 120000) {
+        const DWORD r = MsgWaitForMultipleObjects(1, &sei.hProcess, FALSE, 200, QS_ALLINPUT);
+        if (r == WAIT_OBJECT_0) { finished = true; break; }
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    DWORD code = 1;
+    if (finished) GetExitCodeProcess(sei.hProcess, &code);
+    CloseHandle(sei.hProcess);
+    return finished && code == 0;
+}
+
+static bool HasArg(const wchar_t* arg) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    bool found = false;
+    if (argv) {
+        for (int i = 1; i < argc; ++i) {
+            if (_wcsicmp(argv[i], arg) == 0) found = true;
+        }
+        LocalFree(argv);
+    }
+    return found;
+}
+
+// ---------------------------------------------------------------- автозагрузка
+// Предпочтительный способ — задача планировщика "при входе в систему" с наивысшими правами: программа запускается
+// с правами администратора без запроса UAC. Для её создания нужны права администратора. Если их нет — обычный
+// запуск через раздел Run реестра текущего пользователя.
+static const wchar_t* kTaskName = L"LangSwitch";
+static const wchar_t* kRunValue = L"LangSwitch";
+static const wchar_t* kRunKeyPath = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+template <class T>
+struct Com {
+    T* p;
+    Com() : p(NULL) {}
+    ~Com() { if (p) p->Release(); }
+    T** operator&() { return &p; }
+    T* operator->() const { return p; }
+private:
+    Com(const Com&);
+    Com& operator=(const Com&);
+};
+
+struct Bstr {
+    BSTR s;
+    explicit Bstr(const wchar_t* w) : s(SysAllocString(w)) {}
+    ~Bstr() { SysFreeString(s); }
+    operator BSTR() const { return s; }
+private:
+    Bstr(const Bstr&);
+    Bstr& operator=(const Bstr&);
+};
+
+static std::wstring StripQuotes(std::wstring s) {
+    while (!s.empty() && s.front() == L'"') s.erase(0, 1);
+    while (!s.empty() && s.back() == L'"') s.pop_back();
+    return s;
+}
+
+static bool RunKeyEnabled() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+    wchar_t buf[1024] = {0};
+    DWORD sz = sizeof(buf) - sizeof(wchar_t), type = 0;
+    bool ok = false;
+    if (RegQueryValueExW(k, kRunValue, NULL, &type, (LPBYTE)buf, &sz) == ERROR_SUCCESS && type == REG_SZ)
+        ok = _wcsicmp(StripQuotes(buf).c_str(), g_exePath.c_str()) == 0;
+    RegCloseKey(k);
+    return ok;
+}
+
+static void SetRunKey(bool on) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
+    if (on) {
+        const std::wstring v = L"\"" + g_exePath + L"\"";
+        RegSetValueExW(k, kRunValue, 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(k, kRunValue);
+    }
+    RegCloseKey(k);
+}
+
+static std::wstring CurrentUserName() {
+    wchar_t user[256] = {0}, dom[256] = {0};
+    DWORD n = 256;
+    GetUserNameW(user, &n);
+    GetEnvironmentVariableW(L"USERDOMAIN", dom, 256);
+    return dom[0] ? std::wstring(dom) + L"\\" + user : std::wstring(user);
+}
+
+// Подключиться к планировщику и открыть корневую папку задач
+static bool OpenTaskRoot(Com<ITaskService>& svc, Com<ITaskFolder>& root) {
+    if (FAILED(CoCreateInstance(CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER, IID_ITaskService, (void**)&svc)))
+        return false;
+    VARIANT e;
+    VariantInit(&e);
+    if (FAILED(svc->Connect(e, e, e, e))) return false;
+    Bstr folder(L"\\");
+    return SUCCEEDED(svc->GetFolder(folder, &root));
+}
+
+// exists — задача с таким именем есть; path — путь к программе в её действии (пусто, если прочитать не удалось)
+static bool QueryTask(bool& exists, std::wstring& path) {
+    exists = false;
+    path.clear();
+    Com<ITaskService> svc;
+    Com<ITaskFolder> root;
+    if (!OpenTaskRoot(svc, root)) return false;
+
+    Com<IRegisteredTask> task;
+    HRESULT hr;
+    {
+        Bstr n(kTaskName);
+        hr = root->GetTask(n, &task);
+    }
+    if (FAILED(hr)) {
+        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
+            return true;  // задачи нет
+        exists = true;    // задача есть, но прочитать её без прав администратора нельзя
+        return true;
+    }
+    exists = true;
+
+    Com<ITaskDefinition> def;
+    if (SUCCEEDED(task->get_Definition(&def))) {
+        Com<IActionCollection> acts;
+        if (SUCCEEDED(def->get_Actions(&acts))) {
+            Com<IAction> act;
+            if (SUCCEEDED(acts->get_Item(1, &act))) {
+                Com<IExecAction> exec;
+                if (SUCCEEDED(act->QueryInterface(IID_IExecAction, (void**)&exec))) {
+                    BSTR p = NULL;
+                    if (SUCCEEDED(exec->get_Path(&p)) && p) {
+                        path = StripQuotes(p);
+                        SysFreeString(p);
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// Создать (или обновить) задачу запуска при входе в систему с наивысшими правами. Нужны права администратора.
+static bool RegisterLogonTask() {
+    const std::wstring dir = g_exeDir.empty() ? g_exeDir : g_exeDir.substr(0, g_exeDir.size() - 1);
+    const std::wstring user = CurrentUserName();
+
+    Com<ITaskService> svc;
+    Com<ITaskFolder> root;
+    if (!OpenTaskRoot(svc, root)) return false;
+
+    Com<ITaskDefinition> def;
+    if (FAILED(svc->NewTask(0, &def))) return false;
+
+    Com<IRegistrationInfo> info;
+    if (SUCCEEDED(def->get_RegistrationInfo(&info))) {
+        Bstr d(L"LangSwitch: запуск при входе в систему");
+        info->put_Description(d);
+    }
+
+    Com<IPrincipal> pr;
+    if (FAILED(def->get_Principal(&pr))) return false;
+    pr->put_LogonType(TASK_LOGON_INTERACTIVE_TOKEN);
+    pr->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
+
+    Com<ITaskSettings> st;
+    if (SUCCEEDED(def->get_Settings(&st))) {
+        st->put_StartWhenAvailable(VARIANT_TRUE);
+        st->put_DisallowStartIfOnBatteries(VARIANT_FALSE);
+        st->put_StopIfGoingOnBatteries(VARIANT_FALSE);
+        st->put_MultipleInstances(TASK_INSTANCES_IGNORE_NEW);
+        Bstr lim(L"PT0S");  // без ограничения времени работы
+        st->put_ExecutionTimeLimit(lim);
+    }
+
+    Com<ITriggerCollection> trigs;
+    if (FAILED(def->get_Triggers(&trigs))) return false;
+    Com<ITrigger> trig;
+    if (FAILED(trigs->Create(TASK_TRIGGER_LOGON, &trig))) return false;
+    Com<ILogonTrigger> logon;
+    if (FAILED(trig->QueryInterface(IID_ILogonTrigger, (void**)&logon))) return false;
+    {
+        Bstr id(L"LangSwitchLogon");
+        logon->put_Id(id);
+        Bstr u(user.c_str());
+        logon->put_UserId(u);
+    }
+
+    Com<IActionCollection> acts;
+    if (FAILED(def->get_Actions(&acts))) return false;
+    Com<IAction> act;
+    if (FAILED(acts->Create(TASK_ACTION_EXEC, &act))) return false;
+    Com<IExecAction> exec;
+    if (FAILED(act->QueryInterface(IID_IExecAction, (void**)&exec))) return false;
+    {
+        Bstr p(g_exePath.c_str());
+        exec->put_Path(p);
+        Bstr w(dir.c_str());
+        exec->put_WorkingDirectory(w);
+    }
+
+    VARIANT e;
+    VariantInit(&e);
+    VARIANT sddl;
+    VariantInit(&sddl);
+    sddl.vt = VT_BSTR;
+    sddl.bstrVal = SysAllocString(L"");
+    Com<IRegisteredTask> reg;
+    Bstr name(kTaskName);
+    const HRESULT hr = root->RegisterTaskDefinition(name, def.p, TASK_CREATE_OR_UPDATE, e, e,
+                                                    TASK_LOGON_INTERACTIVE_TOKEN, sddl, &reg);
+    VariantClear(&sddl);
+    return SUCCEEDED(hr);
+}
+
+// Удалить задачу. Если её нет — тоже успех.
+static bool DeleteLogonTask() {
+    Com<ITaskService> svc;
+    Com<ITaskFolder> root;
+    if (!OpenTaskRoot(svc, root)) return false;
+    Bstr name(kTaskName);
+    const HRESULT hr = root->DeleteTask(name, 0);
+    return SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+}
+
+struct AutoInfo {
+    bool task;  // автозагрузка через планировщик (с правами администратора)
+    bool run;   // обычная автозагрузка текущего пользователя
+};
+
+static AutoInfo GetAutostartInfo() {
+    AutoInfo a;
+    a.task = false;
+    a.run = RunKeyEnabled();
+    bool exists = false;
+    std::wstring p;
+    if (QueryTask(exists, p) && exists && (p.empty() || _wcsicmp(p.c_str(), g_exePath.c_str()) == 0)) a.task = true;
+    return a;
+}
+
+// Служебный режим: программа запущена с правами администратора только чтобы изменить автозагрузку
+static int RunAutostartHelper(bool on) {
+    const HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    bool ok;
+    if (on) {
+        ok = RegisterLogonTask();
+        if (ok) SetRunKey(false);  // задача уже запускает программу; второй запуск не нужен
+    } else {
+        SetRunKey(false);
+        ok = DeleteLogonTask();
+    }
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return ok ? 0 : 1;
+}
+
+// ---------------------------------------------------------------- окно управления (при повторном запуске)
+enum { ID_BTN_STOP = 101, ID_BTN_ADMIN = 102, ID_BTN_AUTO = 103 };
+
+static const COLORREF kBg = RGB(30, 30, 30);
+static const COLORREF kBtn = RGB(48, 48, 48);
+static const COLORREF kBtnHover = RGB(64, 64, 64);
+static const COLORREF kBtnDown = RGB(38, 38, 38);
+static const COLORREF kBorder = RGB(74, 74, 74);
+static const COLORREF kText = RGB(236, 236, 236);
+static const COLORREF kMuted = RGB(150, 150, 150);
+static const COLORREF kGreen = RGB(84, 206, 126);
+static const COLORREF kRed = RGB(244, 92, 92);
+static const COLORREF kAccent = RGB(96, 165, 250);
+
+static HWND g_dlg = NULL, g_btnStop = NULL, g_btnAdmin = NULL, g_btnAuto = NULL, g_hover = NULL;
+static HFONT g_fontTitle = NULL, g_fontText = NULL, g_fontBtn = NULL;
+static WNDPROC g_btnProc = NULL;
+static int g_dpi = 96;
+static bool g_runElevated = false;  // работающая копия запущена с правами администратора
+static bool g_autoOn = false;
+static bool g_dlgBusy = false;
+
+static int Sc(int v) { return MulDiv(v, g_dpi, 96); }
+
+static HFONT MakeFont(int pt, int weight) {
+    return CreateFontW(-MulDiv(pt, g_dpi, 72), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                       L"Segoe UI");
+}
+
+// Тёмный заголовок окна (Windows 10 1809+ / Windows 11)
+static void ApplyDarkTitleBar(HWND h) {
+    HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
+    if (!dwm) return;
+    typedef HRESULT(WINAPI * SetAttrFn)(HWND, DWORD, LPCVOID, DWORD);
+    SetAttrFn fn = (SetAttrFn)GetProcAddress(dwm, "DwmSetWindowAttribute");
+    if (fn) {
+        const BOOL dark = TRUE;
+        if (FAILED(fn(h, 20, &dark, sizeof(dark)))) fn(h, 19, &dark, sizeof(dark));
+        const COLORREF cap = kBg, txt = kText;
+        fn(h, 35, &cap, sizeof(cap));  // цвет заголовка (Windows 11)
+        fn(h, 36, &txt, sizeof(txt));  // цвет текста заголовка (Windows 11)
+    }
+    FreeLibrary(dwm);
+}
+
+static LRESULT CALLBACK BtnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_MOUSEMOVE:
+            if (g_hover != h) {
+                g_hover = h;
+                TRACKMOUSEEVENT t;
+                ZeroMemory(&t, sizeof(t));
+                t.cbSize = sizeof(t);
+                t.dwFlags = TME_LEAVE;
+                t.hwndTrack = h;
+                TrackMouseEvent(&t);
+                InvalidateRect(h, NULL, FALSE);
+            }
+            break;
+        case WM_MOUSELEAVE:
+            if (g_hover == h) {
+                g_hover = NULL;
+                InvalidateRect(h, NULL, FALSE);
+            }
+            break;
+        case WM_SETCURSOR:
+            if (IsWindowEnabled(h)) {
+                SetCursor(LoadCursorW(NULL, IDC_HAND));
+                return TRUE;
+            }
+            break;
+        case WM_ERASEBKGND:
+            return 1;
+    }
+    return CallWindowProcW(g_btnProc, h, m, w, l);
+}
+
+static HWND MakeButton(int id, const wchar_t* text, int y, int w) {
+    HWND b = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, Sc(24), y, w,
+                             Sc(44), g_dlg, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
+    if (b) {
+        if (!g_btnProc) g_btnProc = (WNDPROC)GetWindowLongPtrW(b, GWLP_WNDPROC);
+        SetWindowLongPtrW(b, GWLP_WNDPROC, (LONG_PTR)BtnProc);
+    }
+    return b;
+}
+
+static void DrawButton(const DRAWITEMSTRUCT* d) {
+    HDC dc = d->hDC;
+    const RECT rc = d->rcItem;
+    const bool disabled = (d->itemState & ODS_DISABLED) != 0 || g_dlgBusy;
+    const bool pressed = (d->itemState & ODS_SELECTED) != 0;
+    const bool hover = (g_hover == d->hwndItem);
+    const bool focus = (d->itemState & ODS_FOCUS) != 0 && (d->itemState & ODS_NOFOCUSRECT) == 0;
+
+    HBRUSH bg = CreateSolidBrush(kBg);
+    FillRect(dc, &rc, bg);
+    DeleteObject(bg);
+
+    const COLORREF fill = pressed ? kBtnDown : ((hover && !disabled) ? kBtnHover : kBtn);
+    HBRUSH fb = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, focus ? Sc(2) : 1, focus ? kAccent : kBorder);
+    HGDIOBJ ob = SelectObject(dc, fb);
+    HGDIOBJ op = SelectObject(dc, pen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, Sc(10), Sc(10));
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(fb);
+    DeleteObject(pen);
+
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ of = SelectObject(dc, g_fontBtn);
+    const COLORREF txt = disabled ? kMuted : kText;
+
+    if (d->CtlID == ID_BTN_AUTO) {
+        const wchar_t* prefix = L"Автозагрузка: ";
+        const wchar_t* status = g_autoOn ? L"включена" : L"выключена";
+        const int lp = (int)wcslen(prefix), ls = (int)wcslen(status);
+        SIZE a, b;
+        GetTextExtentPoint32W(dc, prefix, lp, &a);
+        GetTextExtentPoint32W(dc, status, ls, &b);
+        const int x = rc.left + ((rc.right - rc.left) - (a.cx + b.cx)) / 2;
+        const int y = rc.top + ((rc.bottom - rc.top) - a.cy) / 2;
+        SetTextColor(dc, txt);
+        TextOutW(dc, x, y, prefix, lp);
+        SetTextColor(dc, disabled ? kMuted : (g_autoOn ? kGreen : kRed));
+        TextOutW(dc, x + a.cx, y, status, ls);
+    } else {
+        wchar_t text[64] = {0};
+        GetWindowTextW(d->hwndItem, text, 64);
+        RECT tr = rc;
+        SetTextColor(dc, txt);
+        DrawTextW(dc, text, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, of);
+}
+
+static void PaintDialog(HDC dc) {
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ old = SelectObject(dc, g_fontTitle);
+    SetTextColor(dc, kText);
+    RECT r = {Sc(24), Sc(20), Sc(376), Sc(50)};
+    DrawTextW(dc, L"LangSwitch", -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(dc, g_fontText);
+    SetTextColor(dc, kMuted);
+    r.top = Sc(54);
+    r.bottom = Sc(76);
+    DrawTextW(dc, L"Программа уже запущена. Выберите действие.", -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    if (g_runElevated) {
+        SetTextColor(dc, kGreen);
+        r.top = Sc(80);
+        r.bottom = Sc(102);
+        DrawTextW(dc, L"Работает с правами администратора", -1, &r, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, old);
+}
+
+// Включить или выключить автозагрузку
+static void DoToggleAutostart() {
+    const AutoInfo a = GetAutostartInfo();
+    if (a.task || a.run) {
+        SetRunKey(false);
+        if (a.task) {
+            if (g_elevated) DeleteLogonTask();
+            else RunSelfElevated(L"/autostart-off", g_dlg, true);
+        }
+        return;
+    }
+
+    bool done = false;
+    if (g_elevated) {
+        done = RegisterLogonTask();
+        if (done) SetRunKey(false);
+    } else {
+        done = RunSelfElevated(L"/autostart-on", g_dlg, true);  // запрос UAC
+    }
+    if (!done) SetRunKey(true);  // права администратора недоступны — обычная автозагрузка текущего пользователя
+}
+
+static void SetButtonsEnabled(bool enabled) {
+    if (g_btnStop) EnableWindow(g_btnStop, enabled);
+    if (g_btnAdmin) EnableWindow(g_btnAdmin, enabled);
+    if (g_btnAuto) EnableWindow(g_btnAuto, enabled);
+}
+
+static void ToggleAutostartUi() {
+    g_dlgBusy = true;
+    SetButtonsEnabled(false);
+    UpdateWindow(g_dlg);
+
+    DoToggleAutostart();
+
+    const AutoInfo a = GetAutostartInfo();
+    g_autoOn = a.task || a.run;
+    g_dlgBusy = false;
+    SetButtonsEnabled(true);
+    InvalidateRect(g_btnAuto, NULL, FALSE);
+    SetFocus(g_btnAuto);
+}
+
+static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_ERASEBKGND: {
+            RECT rc;
+            GetClientRect(h, &rc);
+            HBRUSH b = CreateSolidBrush(kBg);
+            FillRect((HDC)w, &rc, b);
+            DeleteObject(b);
+            return 1;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            PaintDialog(dc);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_DRAWITEM:
+            DrawButton((const DRAWITEMSTRUCT*)l);
+            return TRUE;
+        case WM_COMMAND:
+            if (HIWORD(w) == BN_CLICKED) {
+                switch (LOWORD(w)) {
+                    case ID_BTN_STOP:
+                        StopRunning();
+                        DestroyWindow(h);
+                        break;
+                    case ID_BTN_ADMIN:
+                        // перезапуск с правами администратора: новая копия сама закроет старую и займёт её место
+                        if (RunSelfElevated(L"/takeover", h, false)) DestroyWindow(h);
+                        break;
+                    case ID_BTN_AUTO:
+                        ToggleAutostartUi();
+                        break;
+                }
+            } else if (LOWORD(w) == IDCANCEL) {
+                DestroyWindow(h);
+            }
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void ShowControlDialog(HINSTANCE hInst) {
+    const HRESULT coHr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    HDC sdc = GetDC(NULL);
+    g_dpi = GetDeviceCaps(sdc, LOGPIXELSX);
+    ReleaseDC(NULL, sdc);
+    if (g_dpi < 96) g_dpi = 96;
+
+    g_runElevated = RunningIsElevated();
+    {
+        const AutoInfo a = GetAutostartInfo();
+        g_autoOn = a.task || a.run;
+    }
+
+    g_fontTitle = MakeFont(16, FW_SEMIBOLD);
+    g_fontText = MakeFont(10, FW_NORMAL);
+    g_fontBtn = MakeFont(11, FW_NORMAL);
+
+    WNDCLASSW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = DlgProc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));
+    wc.lpszClassName = L"LangSwitchDlg";
+    RegisterClassW(&wc);
+
+    const bool showAdmin = !g_runElevated;
+    const int nBtn = showAdmin ? 3 : 2;
+    const int headerH = g_runElevated ? 106 : 80;  // в единицах при 96 DPI
+    const int clientW = Sc(400);
+    const int clientH = Sc(headerH + 14) + nBtn * Sc(44) + (nBtn - 1) * Sc(10) + Sc(24);
+
+    const DWORD style = WS_CAPTION | WS_SYSMENU;
+    RECT r = {0, 0, clientW, clientH};
+    AdjustWindowRectEx(&r, style, FALSE, 0);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    RECT wa;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    const int x = wa.left + ((wa.right - wa.left) - ww) / 2;
+    const int y = wa.top + ((wa.bottom - wa.top) - wh) / 2;
+
+    g_dlg = CreateWindowExW(0, wc.lpszClassName, L"LangSwitch", style, x, y, ww, wh, NULL, NULL, hInst, NULL);
+    if (g_dlg) {
+        ApplyDarkTitleBar(g_dlg);
+
+        const int bw = Sc(352);
+        int by = Sc(headerH + 14);
+        g_btnStop = MakeButton(ID_BTN_STOP, L"Остановить", by, bw);
+        by += Sc(54);
+        if (showAdmin) {
+            g_btnAdmin = MakeButton(ID_BTN_ADMIN, L"Права администратора", by, bw);
+            by += Sc(54);
+        }
+        g_btnAuto = MakeButton(ID_BTN_AUTO, L"", by, bw);
+
+        ShowWindow(g_dlg, SW_SHOW);
+        UpdateWindow(g_dlg);
+        SetForegroundWindow(g_dlg);
+        SetFocus(g_btnStop);
+
+        MSG msg;
+        while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+            if (msg.message == WM_KEYDOWN) {
+                if (msg.wParam == VK_ESCAPE) {
+                    DestroyWindow(g_dlg);
+                    continue;
+                }
+                if (msg.wParam == VK_RETURN) {
+                    HWND f = GetFocus();
+                    if (f && (f == g_btnStop || f == g_btnAdmin || f == g_btnAuto)) {
+                        SendMessageW(f, BM_CLICK, 0, 0);
+                        continue;
+                    }
+                }
+            }
+            if (IsDialogMessageW(g_dlg, &msg)) continue;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    DeleteObject(g_fontTitle);
+    DeleteObject(g_fontText);
+    DeleteObject(g_fontBtn);
+    if (SUCCEEDED(coHr)) CoUninitialize();
+}
+
 // ---------------------------------------------------------------- окно (скрытое, нужно для сообщений, таймера и буфера обмена)
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (g_msgCmd != 0 && m == g_msgCmd) {
+        if (w == CMD_QUIT) {
+            PostMessageW(h, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        if (w == CMD_QUERY) return 0x100 | (g_elevated ? 1 : 0);
+        return 0;
+    }
     switch (m) {
         case WM_TRIGGER:
             if (!g_busy.exchange(true)) {
@@ -1840,31 +2535,49 @@ static void EnableDpiAwareness() {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    HANDLE mtx = CreateMutexW(NULL, TRUE, L"Local\\LangSwitch_SingleInstance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        // Программа уже работает: предлагаем её остановить
-        if (MessageBoxW(NULL, L"Вы хотите остановить работу LangSwitch?", L"LangSwitch",
-                        MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES) {
-            HWND running = FindWindowW(L"LangSwitchWnd", NULL);
-            if (running) PostMessageW(running, WM_CLOSE, 0, 0);
+    EnableDpiAwareness();
+
+    wchar_t path[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    g_exePath = path;
+    g_exeDir = g_exePath.substr(0, g_exePath.find_last_of(L"\\/") + 1);
+    g_iniPath = g_exeDir + L"LangSwitch.ini";
+    g_msgCmd = RegisterWindowMessageW(L"LangSwitch.Command.1");
+    g_elevated = IsElevated();
+
+    // Служебные режимы: программа запущена с правами администратора только чтобы изменить автозагрузку
+    if (HasArg(L"/autostart-on")) return RunAutostartHelper(true);
+    if (HasArg(L"/autostart-off")) return RunAutostartHelper(false);
+    const bool takeover = HasArg(L"/takeover");
+
+    HANDLE mtx = CreateMutexW(NULL, TRUE, kMutexName);
+    const DWORD mtxErr = GetLastError();
+    // Если работающая копия запущена с правами администратора, мьютекс для обычной копии недоступен (ACCESS_DENIED)
+    if (mtxErr == ERROR_ALREADY_EXISTS || (!mtx && mtxErr == ERROR_ACCESS_DENIED)) {
+        if (!takeover) {
+            if (mtx) CloseHandle(mtx);
+            ShowControlDialog(hInst);  // программа уже запущена: предлагаем действия
+            return 0;
         }
-        if (mtx) CloseHandle(mtx);
-        return 0;
+
+        // Перезапуск с правами администратора: закрываем старую копию и занимаем её место
+        StopRunning();
+        if (mtx) { CloseHandle(mtx); mtx = NULL; }
+        for (int i = 0; i < 50 && !mtx; ++i) {
+            Sleep(100);
+            HANDLE m2 = CreateMutexW(NULL, TRUE, kMutexName);
+            if (m2 && GetLastError() != ERROR_ALREADY_EXISTS) mtx = m2;
+            else if (m2) CloseHandle(m2);
+        }
+        if (!mtx) return 1;  // старая копия не закрылась
     }
 
-    EnableDpiAwareness();
     InitializeCriticalSection(&g_cs);
     InitializeCriticalSection(&g_layCs);
 
     g_fmtHistory = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
     g_fmtCloud = RegisterClipboardFormatW(L"CanUploadToCloudClipboard");
     g_fmtMonitor = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
-
-    wchar_t path[MAX_PATH] = {0};
-    GetModuleFileNameW(NULL, path, MAX_PATH);
-    std::wstring exePath = path;
-    g_exeDir = exePath.substr(0, exePath.find_last_of(L"\\/") + 1);
-    g_iniPath = g_exeDir + L"LangSwitch.ini";
 
     if (GetFileAttributesW(g_iniPath.c_str()) == INVALID_FILE_ATTRIBUTES) SaveDefaultSettings();
     LoadSettings();
@@ -1880,6 +2593,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     RegisterClassW(&wc);
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"LangSwitch", WS_OVERLAPPED, 0, 0, 0, 0, NULL, NULL, hInst, NULL);
     if (!g_hwnd) return 1;
+
+    // Разрешаем копиям без прав администратора присылать служебные команды (закрыться / сообщить права)
+    if (g_msgCmd) ChangeWindowMessageFilterEx(g_hwnd, g_msgCmd, MSGFLT_ALLOW, NULL);
 
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(NULL), 0);
     g_msHook = SetWindowsHookExW(WH_MOUSE_LL, MsProc, GetModuleHandleW(NULL), 0);
