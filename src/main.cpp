@@ -1,4 +1,3 @@
-#include <cstdarg>
 // LangSwitch — переключение раскладки (латиница <-> кириллица) двойным нажатием Ctrl
 #ifndef UNICODE
 #define UNICODE
@@ -70,81 +69,6 @@ static std::wstring g_exeDir, g_iniPath;  // g_exeDir заканчивается
 static UINT g_fmtHistory = 0, g_fmtCloud = 0, g_fmtMonitor = 0;
 
 static const wchar_t* kSection = L"LangSwitch";
-
-// ВРЕМЕННАЯ диагностика: пишет LangSwitch.log рядом с программой, только если рядом лежит файл LangSwitch.debug
-static void Log(const wchar_t* fmt, ...) {
-    if (GetFileAttributesW((g_exeDir + L"LangSwitch.debug").c_str()) == INVALID_FILE_ATTRIBUTES) return;
-    wchar_t msg[512];
-    va_list ap;
-    va_start(ap, fmt);
-    _vsnwprintf(msg, 511, fmt, ap);
-    va_end(ap);
-    msg[511] = 0;
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t line[640];
-    _snwprintf(line, 639, L"%02d:%02d:%02d.%03d %ls\r\n", (int)st.wHour, (int)st.wMinute, (int)st.wSecond,
-               (int)st.wMilliseconds, msg);
-    line[639] = 0;
-    HANDLE h = CreateFileW((g_exeDir + L"LangSwitch.log").c_str(), FILE_APPEND_DATA,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    char u8[1700];
-    const int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, u8, (int)sizeof(u8), NULL, NULL);
-    if (n > 1) {
-        DWORD written = 0;
-        WriteFile(h, u8, (DWORD)(n - 1), &written, NULL);
-    }
-    CloseHandle(h);
-}
-
-// ВРЕМЕННО: какое окно получает ввод и что в нём лежит после ввода (коды символов, а не текст)
-static void LogFieldState(const wchar_t* tag) {
-    if (GetFileAttributesW((g_exeDir + L"LangSwitch.debug").c_str()) == INVALID_FILE_ATTRIBUTES) return;
-    Sleep(150);  // даём приложению обработать ввод
-    HWND fg = GetForegroundWindow();
-    HWND f = fg;
-    if (fg) {
-        GUITHREADINFO gti;
-        ZeroMemory(&gti, sizeof(gti));
-        gti.cbSize = sizeof(gti);
-        if (GetGUIThreadInfo(GetWindowThreadProcessId(fg, NULL), &gti) && gti.hwndFocus) f = gti.hwndFocus;
-    }
-    wchar_t fgCls[64] = {0}, fCls[64] = {0};
-    if (fg) GetClassNameW(fg, fgCls, 64);
-    if (f) GetClassNameW(f, fCls, 64);
-    Log(L"%ls: fgClass=%ls focusClass=%ls focusUnicode=%d acp=%u layout=0x%08X", tag, fgCls, fCls,
-        (f && IsWindowUnicode(f)) ? 1 : 0, (unsigned)GetACP(), (unsigned)(UINT_PTR)GetKeyboardLayout(
-            fg ? GetWindowThreadProcessId(fg, NULL) : 0));
-    if (!f) return;
-
-    // содержимое поля глазами Unicode-функции и "сырые" байты ANSI-функции
-    DWORD_PTR r = 0;
-    wchar_t wb[40] = {0};
-    if (SendMessageTimeoutW(f, WM_GETTEXT, 39, (LPARAM)wb, SMTO_ABORTIFHUNG, 200, &r)) {
-        wchar_t codes[300] = {0};
-        size_t pos = 0;
-        for (size_t i = 0; i < 39 && wb[i]; ++i) {
-            const int k = _snwprintf(codes + pos, 299 - pos, L"%04X ", (unsigned)wb[i]);
-            if (k <= 0) break;
-            pos += (size_t)k;
-        }
-        Log(L"%ls: field (unicode view) codes: %ls", tag, codes);
-    } else {
-        Log(L"%ls: WM_GETTEXT(W) failed", tag);
-    }
-    char ab[40] = {0};
-    if (SendMessageTimeoutA(f, WM_GETTEXT, 39, (LPARAM)ab, SMTO_ABORTIFHUNG, 200, &r)) {
-        wchar_t codes[300] = {0};
-        size_t pos = 0;
-        for (size_t i = 0; i < 39 && ab[i]; ++i) {
-            const int k = _snwprintf(codes + pos, 299 - pos, L"%02X ", (unsigned)(unsigned char)ab[i]);
-            if (k <= 0) break;
-            pos += (size_t)k;
-        }
-        Log(L"%ls: field (ansi view) bytes: %ls", tag, codes);
-    }
-}
 
 static void LoadSettings() {
     const wchar_t* ini = g_iniPath.c_str();
@@ -1321,9 +1245,6 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
         Sleep(40);
     }
 
-Log(L"selection: len=%u", (unsigned)conv.size());
-    LogFieldState(L"selection");
-
     g_selChain.valid = true;
     g_selChain.orig = src;
     g_selChain.result = conv;
@@ -1408,8 +1329,6 @@ static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle) {
         SendBatch(in);
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
     }
-    Log(L"buffer: n=%u pasted=%d", (unsigned)n, done ? 1 : 0);
-    LogFieldState(L"buffer");
 
     {
         Lock l;
