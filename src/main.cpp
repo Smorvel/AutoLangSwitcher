@@ -459,6 +459,75 @@ static void SendChord(WORD mod, WORD key) {
     SendBatch(v);
 }
 
+// ---------------------------------------------------------------- ввод в окна без поддержки Unicode
+// Старые приложения (ANSI-версии Windows API) превращают символы, которых нет в системной ANSI-кодовой странице,
+// в "?". Обычный клавиатурный ввод при этом работает: окну отдаются байты кодовой страницы раскладки.
+// Для таких окон вводим символы так же — сообщениями WM_CHAR с байтами кодовой страницы.
+
+// Окно, которое получает ввод с клавиатуры
+static HWND FocusWindow() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return NULL;
+    GUITHREADINFO gti;
+    ZeroMemory(&gti, sizeof(gti));
+    gti.cbSize = sizeof(gti);
+    if (GetGUIThreadInfo(GetWindowThreadProcessId(fg, NULL), &gti) && gti.hwndFocus) return gti.hwndFocus;
+    return fg;
+}
+
+// Кодирует символ в однобайтовую кодовую страницу без потерь
+static bool EncodeChar(UINT cp, wchar_t c, unsigned char& out) {
+    char b[4] = {0};
+    BOOL used = FALSE;
+    const int n = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, &c, 1, b, 4, NULL, &used);
+    if (n != 1 || used) return false;
+    out = (unsigned char)b[0];
+    return true;
+}
+
+// ANSI-кодовые страницы установленных раскладок (например, 1251 и 1252)
+static std::vector<UINT> LayoutCodePages() {
+    std::vector<UINT> cps;
+    const std::vector<HKL> list = InstalledLayouts();
+    for (size_t i = 0; i < list.size(); ++i) {
+        wchar_t buf[16] = {0};
+        if (GetLocaleInfoW(MAKELCID(LOWORD((UINT_PTR)list[i]), SORT_DEFAULT), LOCALE_IDEFAULTANSICODEPAGE, buf, 16)) {
+            const UINT cp = (UINT)_wtoi(buf);
+            if (cp && std::find(cps.begin(), cps.end(), cp) == cps.end()) cps.push_back(cp);
+        }
+    }
+    return cps;
+}
+
+// true — окно с фокусом не поддерживает Unicode, и в тексте есть символы, которых нет в системной
+// ANSI-кодовой странице (Unicode-ввод превратил бы их в "?"). target — окно для отправки символов.
+static bool NeedAnsiInput(const std::wstring& text, HWND& target) {
+    target = FocusWindow();
+    if (!target || IsWindowUnicode(target)) return false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        unsigned char b = 0;
+        if (text[i] >= 0x80 && !EncodeChar(CP_ACP, text[i], b)) return true;
+    }
+    return false;
+}
+
+static void PostAnsiBackspaces(HWND h, size_t n) {
+    for (size_t i = 0; i < n; ++i) PostMessageA(h, WM_CHAR, VK_BACK, (LPARAM)(1 | (0x0E << 16)));
+}
+
+static void PostAnsiText(HWND h, const std::wstring& s) {
+    const std::vector<UINT> cps = LayoutCodePages();
+    for (size_t i = 0; i < s.size(); ++i) {
+        const wchar_t c = s[i];
+        unsigned char b = 0;
+        bool encoded = c < 0x80;
+        if (encoded) b = (unsigned char)c;
+        for (size_t k = 0; !encoded && k < cps.size(); ++k) encoded = EncodeChar(cps[k], c, b);
+        if (encoded) PostMessageA(h, WM_CHAR, (WPARAM)b, 1);
+        else PostMessageW(h, WM_CHAR, (WPARAM)c, 1);  // кодировать некуда — как раньше
+    }
+}
+
 // ---------------------------------------------------------------- переключение раскладки
 // Эмуляция системной горячей клавиши смены раскладки (Alt+Shift / Ctrl+Shift / `)
 
@@ -1238,9 +1307,14 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
         if (saved) bak.Restore();
     } else {
         if (saved) bak.Restore();  // буфер обмена больше не нужен — возвращаем сразу
-        std::vector<INPUT> in;
-        AddTypedText(in, conv);
-        SendBatch(in);
+        HWND ansiTarget = NULL;
+        if (NeedAnsiInput(conv, ansiTarget)) {
+            PostAnsiText(ansiTarget, conv);  // окно без поддержки Unicode
+        } else {
+            std::vector<INPUT> in;
+            AddTypedText(in, conv);
+            SendBatch(in);
+        }
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
         Sleep(40);
     }
@@ -1320,13 +1394,20 @@ static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle) {
 
     // Везде остальное: Backspace x n и ввод символов
     if (!done) {
-        std::vector<INPUT> in;
-        for (size_t i = 0; i < n; ++i) {
-            in.push_back(KeyInput(VK_BACK, false));
-            in.push_back(KeyInput(VK_BACK, true));
+        HWND ansiTarget = NULL;
+        if (NeedAnsiInput(newText, ansiTarget)) {
+            // Окно без поддержки Unicode: Backspace и символы отправляем сообщениями (так порядок не нарушается)
+            PostAnsiBackspaces(ansiTarget, n);
+            PostAnsiText(ansiTarget, newText);
+        } else {
+            std::vector<INPUT> in;
+            for (size_t i = 0; i < n; ++i) {
+                in.push_back(KeyInput(VK_BACK, false));
+                in.push_back(KeyInput(VK_BACK, true));
+            }
+            AddTypedText(in, newText);
+            SendBatch(in);
         }
-        AddTypedText(in, newText);
-        SendBatch(in);
         PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
     }
 
