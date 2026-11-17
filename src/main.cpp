@@ -546,6 +546,38 @@ static void SwitchLayoutTo(HKL target) {
     }
 }
 
+// ANSI-кодовая страница раскладки (1251 для русской, 1252 для английской)
+static UINT LayoutCodePage(HKL h) {
+    wchar_t buf[16] = {0};
+    if (!GetLocaleInfoW(MAKELCID(LOWORD((UINT_PTR)h), SORT_DEFAULT), LOCALE_IDEFAULTANSICODEPAGE, buf, 16)) return 0;
+    return (UINT)_wtoi(buf);
+}
+
+// Можно ли символ закодировать в ANSI-кодовую страницу без потерь
+static bool FitsCodePage(UINT cp, wchar_t c) {
+    if (c < 0x80 || !cp) return true;
+    char b[4] = {0};
+    BOOL used = FALSE;
+    const int n = WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, &c, 1, b, 4, NULL, &used);
+    return n >= 1 && !used;
+}
+
+// Нужно ли включить целевую раскладку до ввода текста. Некоторые приложения переводят Unicode-ввод в ANSI
+// по кодовой странице раскладки, активной в их потоке в момент приёма, и символы, которых в ней нет
+// (кириллица при английской раскладке), превращаются в "?".
+static bool NeedLayoutFirst(const std::wstring& text, HKL target) {
+    if (!g_cfg.switchLayout || !target) return false;
+    const HKL cur = EffectiveLayout();
+    if (cur == target) return false;
+    // окно не сообщает о смене раскладки: ждать подтверждения было бы лишней задержкой перед вводом
+    if (g_assumedHkl != 0 && g_assumedHwnd == (UINT_PTR)GetForegroundWindow()) return false;
+    const UINT cp = LayoutCodePage(cur);
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (!FitsCodePage(cp, text[i])) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------- буфер обмена
 static bool OpenClip() {
     for (int i = 0; i < 20; ++i) {
@@ -1238,6 +1270,7 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
         if (saved) bak.Restore();
     } else {
         if (saved) bak.Restore();  // буфер обмена больше не нужен — возвращаем сразу
+        if (NeedLayoutFirst(conv, res.endLayout)) SwitchLayoutTo(res.endLayout);
         std::vector<INPUT> in;
         AddTypedText(in, conv);
         SendBatch(in);
@@ -1320,6 +1353,13 @@ static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle) {
 
     // Везде остальное: Backspace x n и ввод символов
     if (!done) {
+        // сначала включаем раскладку, в которой окажется текст (если приложению это нужно, см. NeedLayoutFirst)
+        HKL firstLayout = NULL;
+        for (size_t i = neu.size(); i-- > 0;) {
+            if (!neu[i].neutral && lm::IsLetter(neu[i].ch)) { firstLayout = neu[i].cur; break; }
+        }
+        if (NeedLayoutFirst(newText, firstLayout)) SwitchLayoutTo(firstLayout);
+
         std::vector<INPUT> in;
         for (size_t i = 0; i < n; ++i) {
             in.push_back(KeyInput(VK_BACK, false));
