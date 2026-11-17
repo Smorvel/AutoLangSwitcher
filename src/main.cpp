@@ -1,4 +1,4 @@
-// LangSwitch — переключение раскладки RU <-> EN двойным нажатием Ctrl
+// LangSwitch — переключение раскладки (латиница <-> кириллица) двойным нажатием Ctrl
 #ifndef UNICODE
 #define UNICODE
 #endif
@@ -19,11 +19,14 @@
 #include <process.h>
 #include <uiautomationclient.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +47,7 @@ static const UINT_PTR kTimerChat = 1;          // проверка "открыл
 static const DWORD kChatCheckMs = 250;
 static const DWORD kChatIdleMs = 4000;         // пауза в наборе, после которой чат в игре считается закрытым
 static const size_t kMaxUiaSelection = 5000;   // длиннее — читаем выделение обычным копированием
+static const DWORD kSelChainMs = 120000;       // сколько живёт цепочка повторных конвертаций выделения
 
 // ---------------------------------------------------------------- настройки
 struct Settings {
@@ -101,9 +105,17 @@ static void SaveDefaultSettings() {
 
 // ---------------------------------------------------------------- общее состояние
 struct Rec {
-    wchar_t ch;
-    bool ru;       // в какой раскладке напечатан символ
-    bool neutral;  // не зависит от раскладки (цифры numpad)
+    wchar_t ch;      // текущий символ (после конвертаций)
+    wchar_t origCh;  // символ в том виде, в каком он был набран
+    HKL home;        // раскладка, в которой символ был набран
+    HKL cur;         // раскладка, в которой символ находится сейчас
+    bool neutral;    // не зависит от раскладки (цифры numpad)
+};
+
+// Установленные раскладки по алфавитам. Порядок: сначала последняя использованная, затем остальные по кругу.
+struct Cycle {
+    std::vector<HKL> lat;
+    std::vector<HKL> cyr;
 };
 
 static CRITICAL_SECTION g_cs;
@@ -113,6 +125,8 @@ struct Lock {
 };
 
 static std::vector<Rec> g_buf;      // что напечатано с момента последнего "сброса"
+static bool g_chainActive = false;  // после последней конвертации ничего не набирали: повторное нажатие продолжает цепочку
+static Cycle g_chainCycle;          // порядок раскладок, замороженный на время цепочки
 static bool g_selHint = false;      // есть вероятность, что в приложении что-то выделено
 static bool g_selByMouse = false;   // выделение сделано мышью
 static bool g_selForce = false;     // выделение сделано мышью при зажатом Ctrl — точно текст, проверки не нужны
@@ -122,8 +136,12 @@ static std::atomic<bool> g_busy(false);
 static std::atomic<bool> g_resetAfter(false);
 static std::atomic<DWORD> g_cooldownUntil(0);  // до этого момента (мс) двойной Ctrl не принимается
 
+// Последние использованные раскладки (запоминаются глобально, не по приложениям)
+static std::atomic<UINT_PTR> g_lastLat(0);
+static std::atomic<UINT_PTR> g_lastCyr(0);
+
 // Раскладка, которую мы переключили сами в окне, не сообщающем о смене раскладки (см. EffectiveLayout)
-static std::atomic<int> g_assumedLang(0);        // LANG_RUSSIAN / LANG_ENGLISH, 0 — не используется
+static std::atomic<UINT_PTR> g_assumedHkl(0);    // 0 — не используется
 static std::atomic<UINT_PTR> g_assumedHwnd(0);   // окно, для которого это действует
 static std::atomic<UINT_PTR> g_assumedStale(0);  // что окно продолжает сообщать (устаревшая раскладка)
 
@@ -144,6 +162,16 @@ static DWORD g_ctrlDownTick = 0, g_lastTap = 0;
 static POINT g_downPt = {0, 0}, g_lastDownPt = {0, 0};
 static DWORD g_lastDownTime = 0;
 static int g_clickCount = 0;
+
+// Набор продолжили после конвертации: считаем уже сконвертированный текст набранным в его новых раскладках
+// (вызывать под Lock)
+static void NormalizeChain() {
+    for (size_t i = 0; i < g_buf.size(); ++i) {
+        g_buf[i].home = g_buf[i].cur;
+        g_buf[i].origCh = g_buf[i].ch;
+    }
+    g_chainActive = false;
+}
 
 // "Взвести" набор текста в игре (чат открыт) / сбросить его
 static void GameArm(DWORD now) {
@@ -175,34 +203,167 @@ static void ResetTyping() {
     g_selForce = false;
 }
 
-// ---------------------------------------------------------------- утилиты раскладок
+// ---------------------------------------------------------------- раскладки клавиатуры
+// Таблицы соответствия строятся из установленных раскладок Windows и кэшируются в памяти.
+
+static CRITICAL_SECTION g_layCs;
+struct LayLock {
+    LayLock() { EnterCriticalSection(&g_layCs); }
+    ~LayLock() { LeaveCriticalSection(&g_layCs); }
+};
+
+static std::vector<std::pair<UINT_PTR, int> > g_scriptCache;                 // раскладка -> алфавит
+static std::map<std::pair<UINT_PTR, UINT_PTR>, lm::CharMap> g_mapCache;      // (откуда, куда) -> таблица символов
+static std::map<UINT_PTR, std::set<wchar_t> > g_charsCache;                  // раскладка -> какие символы она даёт
+
+// Скан-коды клавиш основного блока (` 1..0 - =, QWERTY-ряд, ASDF-ряд, \, ZXCV-ряд) и дополнительной клавиши ISO
+static const UINT kScans[] = {0x29, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                              0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+                              0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2B,
+                              0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x56};
+// Клавиши букв — по ним определяем алфавит раскладки
+static const UINT kLetterScans[] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+                                    0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26,
+                                    0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32};
+
 static HKL FgLayout() {
     HWND fg = GetForegroundWindow();
     DWORD tid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
     return GetKeyboardLayout(tid);
 }
 
-static WORD PrimaryLang(HKL h) { return PRIMARYLANGID(LOWORD((UINT_PTR)h)); }
-
-static HKL FindLayout(bool ru) {
-    const WORD want = ru ? LANG_RUSSIAN : LANG_ENGLISH;
-    const WORD preferred = ru ? 0x0419 : 0x0409;
-    int n = GetKeyboardLayoutList(0, NULL);
-    if (n <= 0) return NULL;
-    std::vector<HKL> v(n);
-    GetKeyboardLayoutList(n, v.data());
-    HKL found = NULL;
-    for (HKL h : v) {
-        WORD lid = LOWORD((UINT_PTR)h);
-        if (PRIMARYLANGID(lid) == want) {
-            if (lid == preferred) return h;
-            if (!found) found = h;
-        }
-    }
-    return found;
+// Какой символ даёт клавиша (скан-код) в раскладке h. false — клавиша ничего не печатает.
+static bool KeyChar(HKL h, UINT scan, bool shift, bool caps, wchar_t& out) {
+    const UINT vk = MapVirtualKeyExW(scan, MAPVK_VSC_TO_VK, h);
+    if (!vk) return false;
+    BYTE ks[256];
+    ZeroMemory(ks, sizeof(ks));
+    if (shift) ks[VK_SHIFT] = 0x80;
+    if (caps) ks[VK_CAPITAL] = 0x01;
+    wchar_t buf[8] = {0};
+    const int n = ToUnicodeEx(vk, scan, ks, buf, 8, 0x4, h);  // 0x4 = не менять состояние dead keys
+    if (n != 1 || buf[0] < 0x20 || buf[0] == 0x7F) return false;
+    out = buf[0];
+    return true;
 }
 
-static bool LayoutInstalled(bool ru) { return FindLayout(ru) != NULL; }
+// Алфавит раскладки: 1 — латиница, 2 — кириллица, 0 — другая (иврит, греческая и т.п.)
+static int ScriptOfLayout(HKL h) {
+    if (!h) return 0;
+    {
+        LayLock l;
+        for (size_t i = 0; i < g_scriptCache.size(); ++i) {
+            if (g_scriptCache[i].first == (UINT_PTR)h) return g_scriptCache[i].second;
+        }
+    }
+    int lat = 0, cyr = 0;
+    for (UINT s : kLetterScans) {
+        wchar_t c;
+        if (KeyChar(h, s, false, false, c)) {
+            if (lm::IsLatin(c)) ++lat;
+            else if (lm::IsCyrillic(c)) ++cyr;
+        }
+    }
+    const int script = cyr > lat ? 2 : (lat > cyr ? 1 : 0);
+    LayLock l;
+    g_scriptCache.push_back(std::make_pair((UINT_PTR)h, script));
+    return script;
+}
+
+// Символы, которые раскладка может напечатать
+static const std::set<wchar_t>& LayoutChars(HKL h) {
+    LayLock l;
+    std::map<UINT_PTR, std::set<wchar_t> >::iterator it = g_charsCache.find((UINT_PTR)h);
+    if (it != g_charsCache.end()) return it->second;
+    std::set<wchar_t>& s = g_charsCache[(UINT_PTR)h];
+    for (UINT scan : kScans) {
+        for (int sh = 0; sh < 2; ++sh) {
+            wchar_t c;
+            if (KeyChar(h, scan, sh != 0, false, c)) s.insert(c);
+        }
+    }
+    return s;
+}
+
+// Таблица "символ в раскладке from -> тот же символ на той же клавише в раскладке to"
+static const lm::CharMap& MapFor(HKL from, HKL to) {
+    LayLock l;
+    const std::pair<UINT_PTR, UINT_PTR> key((UINT_PTR)from, (UINT_PTR)to);
+    std::map<std::pair<UINT_PTR, UINT_PTR>, lm::CharMap>::iterator it = g_mapCache.find(key);
+    if (it != g_mapCache.end()) return it->second;
+    lm::CharMap& m = g_mapCache[key];
+    for (UINT scan : kScans) {
+        for (int sh = 0; sh < 2; ++sh) {
+            wchar_t a, b;
+            if (KeyChar(from, scan, sh != 0, false, a) && KeyChar(to, scan, sh != 0, false, b)) {
+                if (m.find(a) == m.end()) m[a] = b;
+            }
+        }
+    }
+    return m;
+}
+
+static std::vector<HKL> InstalledLayouts() {
+    std::vector<HKL> v;
+    int n = GetKeyboardLayoutList(0, NULL);
+    if (n <= 0) return v;
+    v.resize(n);
+    n = GetKeyboardLayoutList(n, v.data());
+    v.resize(n > 0 ? n : 0);
+    return v;
+}
+
+static void RotateTo(std::vector<HKL>& v, UINT_PTR first) {
+    for (size_t i = 0; i < v.size(); ++i) {
+        if ((UINT_PTR)v[i] == first) {
+            std::rotate(v.begin(), v.begin() + i, v.end());
+            return;
+        }
+    }
+}
+
+// Установленные латинские и кириллические раскладки; первыми — последние использованные
+static Cycle BuildCycle() {
+    Cycle c;
+    const std::vector<HKL> list = InstalledLayouts();
+    for (size_t i = 0; i < list.size(); ++i) {
+        const int s = ScriptOfLayout(list[i]);
+        if (s == 1) c.lat.push_back(list[i]);
+        else if (s == 2) c.cyr.push_back(list[i]);
+    }
+    RotateTo(c.lat, g_lastLat);
+    RotateTo(c.cyr, g_lastCyr);
+    return c;
+}
+
+// Запомнить раскладку как последнюю использованную в своём алфавите
+static void NoteLayoutUsed(HKL h) {
+    const int s = ScriptOfLayout(h);
+    if (s == 1) g_lastLat = (UINT_PTR)h;
+    else if (s == 2) g_lastCyr = (UINT_PTR)h;
+}
+
+// В какую раскладку превратить символ, набранный в home и находящийся сейчас в cur.
+// Цепочка: home -> раскладки противоположного алфавита по порядку -> снова home.
+// При двух раскладках это просто переключение туда и обратно.
+static HKL NextTarget(HKL home, HKL cur, const Cycle& cy) {
+    const std::vector<HKL>& opp = (ScriptOfLayout(home) == 1) ? cy.cyr : cy.lat;
+    if (opp.empty()) return cur;
+    if (cur == home) return opp[0];
+    for (size_t i = 0; i < opp.size(); ++i) {
+        if (opp[i] == cur) return (i + 1 < opp.size()) ? opp[i + 1] : home;
+    }
+    return opp[0];
+}
+
+// Если в системе ровно две раскладки — вторая из них
+static HKL OtherLayoutOfTwo(HKL h) {
+    const std::vector<HKL> v = InstalledLayouts();
+    if (v.size() != 2) return NULL;
+    if (v[0] == h) return v[1];
+    if (v[1] == h) return v[0];
+    return NULL;
+}
 
 // Раскладка, в которой на самом деле идёт набор.
 // Обычно это то, что сообщает окно. Но некоторые приложения (например, Epic Games Launcher) не сообщают о смене
@@ -210,19 +371,13 @@ static bool LayoutInstalled(bool ru) { return FindLayout(ru) != NULL; }
 // пока окно не начнёт сообщать что-то другое.
 static HKL EffectiveLayout() {
     const HKL reported = FgLayout();
-    const int a = g_assumedLang;
+    const UINT_PTR a = g_assumedHkl;
     if (a != 0) {
-        if (g_assumedHwnd == (UINT_PTR)GetForegroundWindow() && g_assumedStale == (UINT_PTR)reported) {
-            const HKL h = FindLayout(a == LANG_RUSSIAN);
-            if (h) return h;
-        } else {
-            g_assumedLang = 0;  // окно сменилось или снова сообщает актуальную раскладку — доверяем ему
-        }
+        if (g_assumedHwnd == (UINT_PTR)GetForegroundWindow() && g_assumedStale == (UINT_PTR)reported) return (HKL)a;
+        g_assumedHkl = 0;  // окно сменилось или снова сообщает актуальную раскладку — доверяем ему
     }
     return reported;
 }
-
-static bool IsRuLayoutNow() { return PrimaryLang(EffectiveLayout()) == LANG_RUSSIAN; }
 
 // ---------------------------------------------------------------- SendInput
 static INPUT KeyInput(WORD vk, bool up) {
@@ -360,30 +515,31 @@ static bool WaitLayoutChange(HKL before, DWORD ms) {
     }
 }
 
-static void SwitchLayoutTo(bool ru) {
-    if (!g_cfg.switchLayout) return;
-    const WORD want = ru ? LANG_RUSSIAN : LANG_ENGLISH;
-    if (PrimaryLang(EffectiveLayout()) == want) return;
-    if (!LayoutInstalled(ru)) return;
+// Переключить системную раскладку на target
+static void SwitchLayoutTo(HKL target) {
+    if (!g_cfg.switchLayout || !target) return;
+    if (EffectiveLayout() == target) return;
 
-    // Нажимаем горячую клавишу и смотрим, что изменилось. Нажимать повторно можно, только если раскладка
-    // сменилась, но не на ту (при 3+ раскладках они идут по кругу). Если изменений не видно вообще, приложение
-    // могло просто не сообщить о смене — повторное нажатие вернуло бы раскладку обратно, поэтому останавливаемся.
-    int n = GetKeyboardLayoutList(0, NULL);
-    if (n < 2) return;
+    const std::vector<HKL> list = InstalledLayouts();
+    if (list.size() < 2 || std::find(list.begin(), list.end(), target) == list.end()) return;
+    int n = (int)list.size();
     if (n > 8) n = 8;
-    for (int i = 0; i < n; ++i) {
+
+    // Нажимаем горячую клавишу и смотрим, что изменилось (чтобы дойти до нужной раскладки, достаточно n-1 нажатий).
+    // Если изменений не видно вообще, приложение могло просто не сообщить о смене раскладки — повторное нажатие
+    // вернуло бы раскладку обратно, поэтому останавливаемся.
+    for (int i = 0; i < n - 1; ++i) {
         const HKL before = FgLayout();
-        if (PrimaryLang(EffectiveLayout()) == want) return;
+        if (EffectiveLayout() == target) return;
         if (!SendLayoutHotkey()) return;
         if (!WaitLayoutChange(before, 400)) {
             // Окно не сообщает о смене раскладки (так ведут себя некоторые приложения, например Epic Games Launcher).
             // При двух раскладках одно нажатие горячей клавиши гарантированно включило нужную — запоминаем это,
             // чтобы дальше не полагаться на устаревшие данные окна.
-            if (n == 2) {
+            if (list.size() == 2) {
                 g_assumedStale = (UINT_PTR)before;
                 g_assumedHwnd = (UINT_PTR)GetForegroundWindow();
-                g_assumedLang = (int)want;
+                g_assumedHkl = (UINT_PTR)target;
             }
             return;
         }
@@ -907,6 +1063,84 @@ static bool GameIgnoresTrigger() {
     return !g_selHint;
 }
 
+// ---------------------------------------------------------------- конвертация выделенного текста
+struct SelResult {
+    std::wstring text;  // результат
+    HKL endLayout;      // раскладка, в которую нужно переключиться (по последней букве), или NULL
+};
+
+// Раскладка из списка, которая лучше всего покрывает символы текста (при равенстве — первая в списке)
+static HKL PickHome(const std::vector<HKL>& cand, const std::wstring& text, bool cyr) {
+    if (cand.empty()) return NULL;
+    if (cand.size() == 1) return cand[0];
+    HKL best = cand[0];
+    size_t bestCount = 0;
+    bool first = true;
+    for (size_t k = 0; k < cand.size(); ++k) {
+        const std::set<wchar_t>& chars = LayoutChars(cand[k]);
+        size_t cnt = 0;
+        for (size_t i = 0; i < text.size(); ++i) {
+            const wchar_t c = text[i];
+            if ((cyr ? lm::IsCyrillic(c) : lm::IsLatin(c)) && chars.count(c)) ++cnt;
+        }
+        if (first || cnt > bestCount) { best = cand[k]; bestCount = cnt; first = false; }
+    }
+    return best;
+}
+
+static wchar_t ConvChar(wchar_t c, HKL home, HKL target) {
+    if (target == home) return c;
+    const lm::CharMap& m = MapFor(home, target);
+    const lm::CharMap::const_iterator it = m.find(c);
+    return it == m.end() ? c : it->second;
+}
+
+// Конвертирует выделенный текст. src — текст в исходном виде, step — номер нажатия в цепочке (1 — первое).
+// Набранное латиницей превращается в кириллицу, набранное кириллицей — в латиницу; при нескольких раскладках
+// повторные нажатия перебирают их по кругу, возвращаясь к исходному тексту.
+static SelResult ConvertSelectionText(const std::wstring& src, int step, const Cycle& cy, bool defaultCyr) {
+    SelResult r;
+    r.text = src;
+    r.endLayout = NULL;
+    if (cy.lat.empty() || cy.cyr.empty()) return r;
+
+    const HKL L0 = PickHome(cy.lat, src, false);
+    const HKL C0 = PickHome(cy.cyr, src, true);
+    const std::vector<unsigned char> cls = lm::ClassifyText(src, MapFor(L0, C0), MapFor(C0, L0), defaultCyr);
+
+    // idx == 0 — исходная раскладка (как набрано), иначе — раскладки противоположного алфавита по кругу
+    auto targetFor = [&](HKL home, const std::vector<HKL>& opp) -> HKL {
+        const size_t idx = (size_t)step % (opp.size() + 1);
+        return idx == 0 ? home : opp[idx - 1];
+    };
+    const HKL tLat = targetFor(L0, cy.cyr);  // куда превращаем символы, набранные латиницей
+    const HKL tCyr = targetFor(C0, cy.lat);  // куда — набранные кириллицей
+
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (cls[i] == lm::CC_LATIN) r.text[i] = ConvChar(src[i], L0, tLat);
+        else if (cls[i] == lm::CC_CYRILLIC) r.text[i] = ConvChar(src[i], C0, tCyr);
+    }
+    for (size_t i = src.size(); i-- > 0;) {
+        if (cls[i] != lm::CC_KEEP && lm::IsLetter(r.text[i])) {
+            r.endLayout = (cls[i] == lm::CC_LATIN) ? tLat : tCyr;
+            break;
+        }
+    }
+    return r;
+}
+
+// Цепочка повторных конвертаций выделенного текста
+struct SelChain {
+    bool valid = false;
+    std::wstring orig;    // исходный текст (до первой конвертации цепочки)
+    std::wstring result;  // что мы вставили последним
+    int step = 0;
+    UINT_PTR hwnd = 0;
+    DWORD time = 0;
+    Cycle cycle;
+};
+static SelChain g_selChain;
+
 // ---------------------------------------------------------------- конвертация
 // Заменять текст одной вставкой нужно только в адресной строке браузера: её подсказки и автодополнение
 // реагируют на каждый Backspace и символ, из-за чего текст "печатается" по одному символу.
@@ -935,6 +1169,8 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
         return true;
     }
 
+    const bool defaultCyr = ScriptOfLayout(EffectiveLayout()) == 2;
+
     // Сначала пробуем прочитать выделение через UI Automation: без Ctrl+C и без буфера обмена.
     // Если приложение его не отдаёт — копируем через Ctrl+C.
     std::wstring text;
@@ -943,7 +1179,7 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
     // Текст из UIA используем, только если в нём есть что конвертировать: некоторые приложения
     // (Google Docs) отдают через UIA пустышку вместо настоящего выделения
     bool viaUia = ReadSelectionViaUia(text);
-    if (viaUia && lm::ConvertSelection(text, IsRuLayoutNow()) == text) viaUia = false;
+    if (viaUia && ConvertSelectionText(text, 1, BuildCycle(), defaultCyr).text == text) viaUia = false;
     if (!viaUia) {
         saved = bak.Save();
         if (!CopySelectionViaClipboard(text)) {
@@ -957,7 +1193,23 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
 
     { Lock l; g_selHint = false; g_selForce = false; }
 
-    std::wstring conv = lm::ConvertSelection(text, IsRuLayoutNow());
+    // Если выделен тот же текст, который мы только что вставили, продолжаем цепочку (следующая раскладка по кругу).
+    // Иначе начинаем новую: запоминаем текущую раскладку и берём последние использованные.
+    std::wstring src = text;
+    int step = 1;
+    Cycle cycle;
+    if (g_selChain.valid && g_selChain.hwnd == (UINT_PTR)fg && text == g_selChain.result &&
+        (DWORD)(GetTickCount() - g_selChain.time) < kSelChainMs) {
+        src = g_selChain.orig;
+        step = g_selChain.step + 1;
+        cycle = g_selChain.cycle;
+    } else {
+        NoteLayoutUsed(EffectiveLayout());
+        cycle = BuildCycle();
+    }
+
+    const SelResult res = ConvertSelectionText(src, step, cycle, defaultCyr);
+    const std::wstring& conv = res.text;
     if (conv == text) {
         if (saved) bak.Restore();
         return true;
@@ -993,6 +1245,14 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
         Sleep(40);
     }
 
+    g_selChain.valid = true;
+    g_selChain.orig = src;
+    g_selChain.result = conv;
+    g_selChain.step = step;
+    g_selChain.hwnd = (UINT_PTR)fg;
+    g_selChain.time = GetTickCount();
+    g_selChain.cycle = cycle;
+
     if (g_cfg.reselect && conv.size() <= 5000 && !hasCtl) {
         std::vector<INPUT> in;
         AddReselect(in, conv.size());
@@ -1002,16 +1262,13 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
         g_selByMouse = false;
     }
 
-    bool endRu = IsRuLayoutNow();
-    for (size_t i = conv.size(); i-- > 0;) {
-        if (lm::IsLetter(conv[i])) { endRu = lm::IsCyrillic(conv[i]); break; }
-    }
-    SwitchLayoutTo(endRu);
+    SwitchLayoutTo(res.endLayout);
     return true;
 }
 
-static void ConvertBuffer(const std::vector<Rec>& snap) {
+static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle) {
     if (snap.empty()) return;
+    if (cycle.lat.empty() || cycle.cyr.empty()) return;  // нужны и латинская, и кириллическая раскладки
 
     size_t start = 0;
     if (!g_cfg.wholeText) {
@@ -1021,13 +1278,18 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
         start = i;
     }
 
+    // Каждый символ переходит в следующую раскладку своей цепочки: набранное латиницей — в кириллицу,
+    // набранное кириллицей — в латиницу; при нескольких раскладках повторные нажатия перебирают их по кругу
     std::vector<Rec> neu;
     std::wstring newText;
     for (size_t i = start; i < snap.size(); ++i) {
         Rec r = snap[i];
         if (!r.neutral) {
-            if (r.ru) { r.ch = lm::RuToEn(r.ch); r.ru = false; }
-            else      { r.ch = lm::EnToRu(r.ch); r.ru = true; }
+            const HKL target = NextTarget(r.home, r.cur, cycle);
+            if (target != r.cur) {
+                r.ch = (target == r.home) ? r.origCh : ConvChar(r.origCh, r.home, target);
+                r.cur = target;
+            }
         }
         neu.push_back(r);
         newText += r.ch;
@@ -1072,17 +1334,22 @@ static void ConvertBuffer(const std::vector<Rec>& snap) {
         Lock l;
         if (g_resetAfter || g_buf.size() != snap.size()) {
             g_buf.clear();
+            g_chainActive = false;
         } else {
             g_buf.resize(start);
             g_buf.insert(g_buf.end(), neu.begin(), neu.end());
+            g_chainActive = true;   // пока ничего не набрано, повторное нажатие продолжит цепочку
+            g_chainCycle = cycle;
         }
     }
 
-    bool endRu = neu.back().ru;
+    // Системная раскладка — та, в которой оказалась последняя буква
+    HKL endLayout = NULL;
     for (size_t i = neu.size(); i-- > 0;) {
-        if (!neu[i].neutral && lm::IsLetter(neu[i].ch)) { endRu = neu[i].ru; break; }
+        if (!neu[i].neutral && lm::IsLetter(neu[i].ch)) { endLayout = neu[i].cur; break; }
     }
-    SwitchLayoutTo(endRu);
+    if (!endLayout) endLayout = neu.back().cur;
+    SwitchLayoutTo(endLayout);
 }
 
 static unsigned __stdcall ConvertThread(void*) {
@@ -1090,8 +1357,9 @@ static unsigned __stdcall ConvertThread(void*) {
 
     Sleep(30);  // чтобы физическое отпускание Ctrl успело обработаться
 
-    bool hint, byMouse, force;
+    bool hint, byMouse, force, chain;
     POINT down, up;
+    Cycle cycle;
     std::vector<Rec> snap;
     {
         Lock l;
@@ -1101,7 +1369,14 @@ static unsigned __stdcall ConvertThread(void*) {
         down = g_selDownPt;
         up = g_selUpPt;
         snap = g_buf;
+        chain = g_chainActive;
+        if (chain) cycle = g_chainCycle;
         g_resetAfter = false;
+    }
+    if (!chain) {
+        // Новая цепочка: запоминаем текущую раскладку и берём последние использованные
+        NoteLayoutUsed(EffectiveLayout());
+        cycle = BuildCycle();
     }
 
     // В игре набранное учитываем, только если чат открыт и набор не "протух"
@@ -1124,7 +1399,7 @@ static unsigned __stdcall ConvertThread(void*) {
         } else {
             bool done = false;
             if (hint) done = ConvertSelection(byMouse, down, up, trusted);
-            if (!done) ConvertBuffer(snap);
+            if (!done) ConvertBuffer(snap, cycle);
         }
     }
 
@@ -1151,10 +1426,10 @@ static bool IsModifierVk(DWORD vk) {
 // Пользователь сам переключил раскладку горячей клавишей. Если мы ведём учёт раскладки вместо окна,
 // которое о ней не сообщает, при двух раскладках она просто сменилась на другую.
 static void OnManualLayoutSwitch() {
-    const int a = g_assumedLang;
+    const UINT_PTR a = g_assumedHkl;
     if (a == 0) return;
-    if (GetKeyboardLayoutList(0, NULL) == 2) g_assumedLang = (a == LANG_RUSSIAN) ? LANG_ENGLISH : LANG_RUSSIAN;
-    else g_assumedLang = 0;  // не знаем, на какую именно
+    const HKL other = OtherLayoutOfTwo((HKL)a);
+    g_assumedHkl = (UINT_PTR)other;  // NULL, если раскладок не две: учёт сбрасывается
 }
 
 // Отслеживаем жест смены раскладки (Alt+Shift / Ctrl+Shift по настройкам Windows, Win+Space)
@@ -1313,7 +1588,10 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
     if (vk == VK_BACK) {
         Lock l;
         if (g_selHint) { g_buf.clear(); g_selHint = false; g_selForce = false; }
-        else if (!g_buf.empty()) g_buf.pop_back();
+        else if (!g_buf.empty()) {
+            if (g_chainActive) NormalizeChain();
+            g_buf.pop_back();
+        }
         return CallNextHookEx(NULL, code, wp, lp);
     }
 
@@ -1353,13 +1631,15 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
     int n = ToUnicodeEx((UINT)vk, k->scanCode, ks, out, 8, 0x4, hkl);  // 0x4 = не менять состояние dead keys
     if (n != 1 || out[0] < 0x20 || out[0] == 0x7F) return CallNextHookEx(NULL, code, wp, lp);
 
-    const WORD lang = PrimaryLang(hkl);
-    const bool isRu = (lang == LANG_RUSSIAN);
-    const bool isEn = (lang == LANG_ENGLISH);
+    const int script = ScriptOfLayout(hkl);  // 1 — латинская раскладка, 2 — кириллическая, 0 — другая
 
     Lock l;
     if (g_selHint) { g_buf.clear(); g_selHint = false; g_selForce = false; }  // набор заменил выделенный текст
-    if (!isRu && !isEn) { g_buf.clear(); return CallNextHookEx(NULL, code, wp, lp); }
+    if (script == 0) { g_buf.clear(); return CallNextHookEx(NULL, code, wp, lp); }
+
+    // запоминаем последнюю использованную латиницу / кириллицу (глобально, не по приложениям)
+    if (script == 1) g_lastLat = (UINT_PTR)hkl;
+    else g_lastCyr = (UINT_PTR)hkl;
 
     if (gi.game) {
         // В игре зажатая клавиша или серия одинаковых символов (wwww) — это управление, а не текст
@@ -1375,9 +1655,13 @@ static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
         }
     }
 
+    if (g_chainActive) NormalizeChain();  // набор продолжился: сконвертированное считаем набранным как есть
+
     Rec r;
     r.ch = out[0];
-    r.ru = isRu;
+    r.origCh = out[0];
+    r.home = hkl;
+    r.cur = hkl;
     r.neutral = (vk >= VK_NUMPAD0 && vk <= VK_DIVIDE);
     g_buf.push_back(r);
     if ((int)g_buf.size() > g_cfg.maxBuffer) {
@@ -1530,6 +1814,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     EnableDpiAwareness();
     InitializeCriticalSection(&g_cs);
+    InitializeCriticalSection(&g_layCs);
 
     g_fmtHistory = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
     g_fmtCloud = RegisterClipboardFormatW(L"CanUploadToCloudClipboard");
@@ -1545,6 +1830,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     LoadSettings();
 
     g_caps = (GetKeyState(VK_CAPITAL) & 1) != 0;
+    NoteLayoutUsed(FgLayout());  // начальные "последние использованные" раскладки
 
     WNDCLASSW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -1570,6 +1856,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     UnhookWindowsHookEx(g_kbHook);
     if (g_msHook) UnhookWindowsHookEx(g_msHook);
+    DeleteCriticalSection(&g_layCs);
     DeleteCriticalSection(&g_cs);
     if (mtx) CloseHandle(mtx);
     return 0;
