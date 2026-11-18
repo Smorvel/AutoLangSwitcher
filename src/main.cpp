@@ -2143,6 +2143,43 @@ static int RunAutostartHelper(bool on) {
     return ok ? 0 : 1;
 }
 
+// Работает ли пользователь под учётной записью администратора с урезанным токеном (повышение через UAC возможно)
+static bool CanSelfElevate() {
+    HANDLE t = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return false;
+    TOKEN_ELEVATION_TYPE type = TokenElevationTypeDefault;
+    DWORD sz = 0;
+    const bool ok = GetTokenInformation(t, TokenElevationType, &type, sizeof(type), &sz) != 0;
+    CloseHandle(t);
+    return ok && type == TokenElevationTypeLimited;
+}
+
+// Запустить созданную ранее задачу автозагрузки: она стартует программу с правами администратора без запроса UAC.
+// true — задача запущена.
+static bool RunLogonTaskNow() {
+    const HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    bool ok = false;
+    bool exists = false;
+    std::wstring p;
+    // запускаем только задачу, которая указывает именно на эту программу
+    if (QueryTask(exists, p) && exists && !p.empty() && _wcsicmp(p.c_str(), g_exePath.c_str()) == 0) {
+        Com<ITaskService> svc;
+        Com<ITaskFolder> root;
+        if (OpenTaskRoot(svc, root)) {
+            Com<IRegisteredTask> task;
+            Bstr n(kTaskName);
+            if (SUCCEEDED(root->GetTask(n, &task))) {
+                Com<IRunningTask> running;
+                VARIANT e;
+                VariantInit(&e);
+                ok = SUCCEEDED(task->Run(e, &running));
+            }
+        }
+    }
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return ok;
+}
+
 // ---------------------------------------------------------------- окно управления (при повторном запуске)
 enum { ID_BTN_STOP = 101, ID_BTN_ADMIN = 102, ID_BTN_AUTO = 103 };
 
@@ -2570,6 +2607,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             else if (m2) CloseHandle(m2);
         }
         if (!mtx) return 1;  // старая копия не закрылась
+    }
+
+    // По умолчанию работаем с правами администратора: иначе Windows не пускает ввод в окна, запущенные от администратора.
+    // Если пользователь отказался в запросе UAC (или повышение не удалось), продолжаем без прав администратора.
+    if (!g_elevated && !HasArg(L"/noelevate") && CanSelfElevate()) {
+        if (mtx) { CloseHandle(mtx); mtx = NULL; }  // освобождаем, чтобы копия с правами администратора заняла место
+        if (RunLogonTaskNow() || RunSelfElevated(L"/noelevate", NULL, false)) return 0;
+        mtx = CreateMutexW(NULL, TRUE, kMutexName);  // отказ или ошибка: продолжаем без прав администратора
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (mtx) CloseHandle(mtx);
+            return 0;
+        }
     }
 
     InitializeCriticalSection(&g_cs);
