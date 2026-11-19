@@ -66,6 +66,7 @@ struct Settings {
     bool switchLayout = true;
     bool reselect = true;
     bool gameFilter = true;    // особый режим для игр (полноэкранные окна, скрытый курсор)
+    bool switchEmpty = false;  // двойной Ctrl переключает раскладку, даже если текст не вводился
     int doubleCtrlMs = 500;
     int maxBuffer = 1000;
 };
@@ -82,6 +83,8 @@ static UINT g_fmtHistory = 0, g_fmtCloud = 0, g_fmtMonitor = 0;
 
 static const wchar_t* kSection = L"LangSwitch";
 
+#include "exclude.h"  // список исключённых программ (exclude.txt)
+
 static void LoadSettings() {
     const wchar_t* ini = g_iniPath.c_str();
     auto geti = [&](const wchar_t* key, int def) {
@@ -91,6 +94,7 @@ static void LoadSettings() {
     g_cfg.switchLayout = geti(L"SwitchLayout", 1) != 0;
     g_cfg.reselect = geti(L"Reselect", 1) != 0;
     g_cfg.gameFilter = geti(L"GameFilter", 1) != 0;
+    g_cfg.switchEmpty = geti(L"SwitchEmpty", 0) != 0;
     g_cfg.doubleCtrlMs = geti(L"DoubleCtrlMs", 500);
     g_cfg.maxBuffer = geti(L"MaxBuffer", 1000);
     if (g_cfg.doubleCtrlMs < 100) g_cfg.doubleCtrlMs = 100;
@@ -111,6 +115,7 @@ static void SaveDefaultSettings() {
     put(L"SwitchLayout", L"1");
     put(L"Reselect", L"1");
     put(L"GameFilter", L"1");
+    put(L"SwitchEmpty", L"0");
     put(L"DoubleCtrlMs", L"500");
     put(L"MaxBuffer", L"1000");
 }
@@ -122,6 +127,7 @@ struct Rec {
     HKL home;        // раскладка, в которой символ был набран
     HKL cur;         // раскладка, в которой символ находится сейчас
     bool neutral;    // не зависит от раскладки (цифры numpad)
+    bool asStart = false;  // начало слова, переключённого автоматически (см. autoswitch.h)
 };
 
 // Установленные раскладки по алфавитам. Порядок: сначала последняя использованная, затем остальные по кругу.
@@ -1100,6 +1106,7 @@ static bool IsChatTriggerVk(DWORD vk) {
 
 // В игре без открытого чата и без выделенного текста двойной Ctrl ни к чему не ведёт
 static bool GameIgnoresTrigger() {
+    if (g_cfg.switchEmpty) return false;  // двойной Ctrl переключает раскладку и в игре
     if (!g_cfg.gameFilter) return false;
     if (g_gameArmed || g_gamePending) return false;
     if (!QueryGame(GetForegroundWindow()).game) return false;
@@ -1408,6 +1415,19 @@ static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle, size
 
 #include "autoswitch.h"  // опциональное авто-переключение раскладки (можно удалить вместе с файлом)
 
+// Двойной Ctrl без введённого текста: переключаем раскладку на последнюю использованную другого алфавита
+static void SwitchLayoutEmpty() {
+    const HKL cur = EffectiveLayout();
+    NoteLayoutUsed(cur);
+    const Cycle cy = BuildCycle();
+    HKL target = NULL;
+    if (ScriptOfLayout(cur) == 1) { if (!cy.cyr.empty()) target = cy.cyr[0]; }
+    else if (!cy.lat.empty()) target = cy.lat[0];
+    if (!target || target == cur) return;
+    SwitchLayoutTo(target);
+    PostMessageW(g_hwnd, WM_PLAYSOUND, 0, 0);
+}
+
 static unsigned __stdcall ConvertThread(void*) {
     HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
@@ -1449,14 +1469,15 @@ static unsigned __stdcall ConvertThread(void*) {
     if (hint || !snap.empty()) {
         if (!trusted && GetFocusKind() == FK_NOTEXT) {
             // Фокус не в поле ввода — это был "ввод в никуда". Ничего не трогаем и забываем набранное.
-            Lock l;
-            g_buf.clear();
-            g_selHint = false;
+            { Lock l; g_buf.clear(); g_selHint = false; }
+            if (g_cfg.switchEmpty) SwitchLayoutEmpty();
         } else {
             bool done = false;
             if (hint) done = ConvertSelection(byMouse, down, up, trusted);
             if (!done) ConvertBuffer(snap, cycle, AsManualStart(snap));
         }
+    } else if (g_cfg.switchEmpty) {
+        SwitchLayoutEmpty();  // текст не вводился: просто переключаем раскладку
     }
 
     if (gi.game && (g_gameArmed || g_gamePending)) g_gameLastKey = GetTickCount();
@@ -2533,6 +2554,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     switch (m) {
         case WM_TRIGGER:
+            if (ExMode(GetForegroundWindow()) == EX_FULL) return 0;  // программа исключена целиком (exclude.txt)
             if (!g_busy.exchange(true)) {
                 uintptr_t th = _beginthreadex(NULL, 0, ConvertThread, NULL, 0, NULL);
                 if (th) CloseHandle((HANDLE)th);
