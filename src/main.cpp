@@ -1311,12 +1311,14 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
     return true;
 }
 
-static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle) {
+static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle, size_t forceStart = (size_t)-1) {
     if (snap.empty()) return;
     if (cycle.lat.empty() || cycle.cyr.empty()) return;  // нужны и латинская, и кириллическая раскладки
 
     size_t start = 0;
-    if (!g_cfg.wholeText) {
+    if (forceStart != (size_t)-1) {
+        start = forceStart;
+    } else if (!g_cfg.wholeText) {
         size_t i = snap.size();
         while (i > 0 && snap[i - 1].ch == L' ') --i;
         while (i > 0 && snap[i - 1].ch != L' ') --i;
@@ -1404,6 +1406,8 @@ static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle) {
     SwitchLayoutTo(endLayout);
 }
 
+#include "autoswitch.h"  // опциональное авто-переключение раскладки (можно удалить вместе с файлом)
+
 static unsigned __stdcall ConvertThread(void*) {
     HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
@@ -1451,7 +1455,7 @@ static unsigned __stdcall ConvertThread(void*) {
         } else {
             bool done = false;
             if (hint) done = ConvertSelection(byMouse, down, up, trusted);
-            if (!done) ConvertBuffer(snap, cycle);
+            if (!done) ConvertBuffer(snap, cycle, AsManualStart(snap));
         }
     }
 
@@ -2646,7 +2650,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     // Разрешаем копиям без прав администратора присылать служебные команды (закрыться / сообщить права)
     if (g_msgCmd) ChangeWindowMessageFilterEx(g_hwnd, g_msgCmd, MSGFLT_ALLOW, NULL);
 
-    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, GetModuleHandleW(NULL), 0);
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, AsSetup(), GetModuleHandleW(NULL), 0);
     g_msHook = SetWindowsHookExW(WH_MOUSE_LL, MsProc, GetModuleHandleW(NULL), 0);
     if (!g_kbHook) {
         MessageBoxW(NULL, L"Не удалось установить перехват клавиатуры.", L"LangSwitch", MB_ICONERROR);
