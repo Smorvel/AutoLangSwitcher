@@ -1,7 +1,8 @@
-// autoswitch.h — опциональное авто-переключение раскладки.
-// Включается строкой AutoSwitch=1 в LangSwitch.ini. Подключается из main.cpp одной директивой #include и использует
-// его внутренние функции, поэтому файл не компилируется отдельно. Чтобы убрать функцию, удалите этот файл
-// и четыре правки в main.cpp (ConvertBuffer, #include, ConvertThread, WinMain).
+// autoswitch.h — опциональное авто-переключение раскладки и словарь Words.txt.
+// Включается строкой AutoSwitch=1 в LangSwitch.ini. Словарь Words.txt работает и при AutoSwitch=0, если файл существует.
+// Подключается из main.cpp одной директивой #include и использует его внутренние функции, поэтому файл не
+// компилируется отдельно. Чтобы убрать функцию, удалите этот файл и три правки в main.cpp
+// (ConvertBuffer: параметр forceStart, #include перед ConvertThread, WinMain: AsSetup), а также AsManualStart.
 #pragma once
 
 // определены в main.cpp ниже места подключения
@@ -10,7 +11,7 @@ static bool IsModifierVk(DWORD vk);
 
 enum { AL_NONE = 0, AL_EN = 1, AL_RU = 2, AL_UK = 3 };
 
-// ---------------------------------------------------------------- таблицы (самые частые буквосочетания языков)
+// ---------------------------------------------------------------- таблицы (частые буквосочетания языков)
 static const wchar_t* kAsBigEn =
     L"th he in er an re on at en nd ti es or te of ed is it al ar st to nt ng se ha as ou io le ve co me de hi ri ro ic "
     L"ne ea ra ce li ch ll be ma si om ur ca el ta la ns di fo ho pe ec pr no ct us ac ot il tr ly nc et ut ss so rs un "
@@ -18,7 +19,9 @@ static const wchar_t* kAsBigEn =
     L"ld ry mp fe bl ab gh ty op wo sa ay ex ke fr oo av ag if ap gr od bo sp rd do uc bu ei ov by rm ep tt oc fa ef cu "
     L"rn sc gi da yo cr cl du ga qu ue ff ba ey ls va um pp ua up lu go ht ru ug ds lt pi rc rr eg au ck ew bi br tl ms "
     L"ye ud mb ip ub oi oa ok ob ib ak ik ph lk lf lp lm rk rb rg rl rv rp nk nn nl nm gn gs gl hy hr kn kl ks ki ku ko "
-    L"ka za ze zi zo xt xp yp yr ys yt yn ym ur us ut ve vi vo";
+    L"ka za ze zi zo xt xp yp yr ys yt yn ym ur us ut ve vi vo eb eg ej ek ep ew ez ob oj ok ow oz uf ug uk ul um un up "
+    L"wn wr wl ws wd rw ww yb yc yd yf yg yl yw yi ya yu ax ay az aw ah ab ac af ag ak ap aq au av az ib id if ig ik "
+    L"ix iz oh ox oy uy uz ym";
 
 static const wchar_t* kAsBigRu =
     L"ст но то на ен ов ни ра во ко ол ор ро по ре ан ер ос ти ли ет ва ль ем ат ал ла ка ть ог го ел ны ск ин ие ой ий "
@@ -30,7 +33,9 @@ static const wchar_t* kAsBigRu =
     L"жа же жи жн жд зо зи зе зы зм зр иб ег аб ек ап аз ав ад аж ак ам ар ас ач ау ах ац аш бн бс вд вк вм вп вт вч вш "
     L"ех еж ез ел еп ер ес еч еш ещ ёт ёл ён ёр им ин ио ип ич иш кн кс кт км лб лг лж лк лм лн лп лс лт лч лш мб мг мм "
     L"мп мс мт мч мя нб нв нж нз нк нл нм нн нп нр нц нч нш ох оц ощ ух уц уш ущ юб юв юг юж юк юл юм юн юр юс ют юх яд "
-    L"яж яй ям яп яр яс яц яч яш";
+    L"яж яй ям яп яр яс яц яч яш ои ио еи ею аю уе уи ёс ёв ёз ёк ёж ьи ьё ьо ьу ья ъе ъё ъя ъю гу гд кё шь шё щё чё жё чь "
+    L"ыс ыр ыд ыб ыг ыж ык ыч ыш ыз ыю бя бю бь бё вя вё вю вь гя гю дя дю дё дь зя зю зь кя кю кь лё лю мя мю мь мё пя пю "
+    L"пь пё рё рю рь сё сю ся сь тё тю тя ть фя фю фь хё хю хя цю цё ща щу щё ое ио аи еа оа уа";
 
 // украинские буквы: добавляются к русским биграммам
 static const wchar_t* kAsBigUk =
@@ -120,8 +125,7 @@ static int AsLayoutLang(HKL h) {
     int lang = AL_NONE;
     const int script = ScriptOfLayout(h);
     if (script == 1) {
-        if (PRIMARYLANGID(LOWORD(reinterpret_cast<ULONG_PTR>(h))) == LANG_ENGLISH)
-    lang = AL_EN;
+        if (PRIMARYLANGID(LOWORD((UINT_PTR)h)) == LANG_ENGLISH) lang = AL_EN;
     } else if (script == 2) {
         const std::set<wchar_t>& ch = LayoutChars(h);
         if (ch.count(L'ў')) lang = AL_NONE;
@@ -138,7 +142,7 @@ struct AsScore {
     bool badStart = false;
 };
 
-// Оценка строки: пары букв считаются только внутри непрерывных групп букв
+// Пары букв считаются только внутри непрерывных групп букв
 static AsScore AsScoreRuns(const std::wstring& s, int lang) {
     AsScore r;
     int missRun = 0, consRun = 0;
@@ -178,23 +182,15 @@ static AsScore AsScoreRuns(const std::wstring& s, int lang) {
     return r;
 }
 
-// Слово очень правдоподобно в языке (целевая раскладка)
-static bool AsTPlausible(const AsScore& s, int pctMin) {
-    if (s.letters < 4 || s.pairs < 3) return false;
-    if (s.badStart || s.vowels == 0 || s.maxConsRun > 4 || s.maxMissRun >= 2) return false;
-    if (s.pairs <= 4) return s.hits == s.pairs;
-    return s.hits * 100 / s.pairs >= pctMin;
-}
-
-// Слово неправдоподобно в языке (набранная раскладка)
-static bool AsHImplausible(const AsScore& s, int pctMax, int missRunPct, bool hasInner) {
-    if (s.letters == 0) return true;
-    if (s.pairs == 0) return hasInner;
-    const int pct = s.hits * 100 / s.pairs;
-    if (pct <= pctMax) return true;
-    if (s.maxMissRun >= 2 && pct <= missRunPct) return true;
-    if (s.vowels == 0 && s.letters >= 3) return true;
-    return false;
+// Правдоподобие слова в языке, 0..100
+static int AsRate(const AsScore& s) {
+    if (s.letters == 0) return 0;
+    int r = s.pairs > 0 ? s.hits * 100 / s.pairs : 50;
+    if (s.vowels == 0 && s.letters >= 2) r -= 30;
+    if (s.maxConsRun > 4) r -= 25;
+    if (s.maxMissRun >= 2) r -= 15;
+    if (s.badStart) r -= 30;
+    return r < 0 ? 0 : r;
 }
 
 // Смех и подобные повторяющиеся междометия (хахаха, пхпхпх, hahaha)
@@ -233,6 +229,11 @@ static bool AsBadChar(wchar_t c) {
     return false;
 }
 
+// ---------------------------------------------------------------- состояние модуля
+static bool g_asHeur = false;  // оценки по биграммам включены (AutoSwitch=1); иначе работает только Words.txt
+
+static bool AsExcluded() { return ExMode(GetForegroundWindow()) != EX_NONE; }
+
 // ---------------------------------------------------------------- словарь пользователя (Words.txt)
 static std::set<std::wstring> g_asDict;
 static FILETIME g_asDictTime = {0, 0};
@@ -242,31 +243,13 @@ static std::wstring AsDictPath() { return g_exeDir + L"Words.txt"; }
 
 static void AsLoadDict() {
     g_asDict.clear();
-    HANDLE h = CreateFileW(AsDictPath().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return;
-    GetFileTime(h, NULL, NULL, &g_asDictTime);
-    const DWORD size = GetFileSize(h, NULL);
-    if (size == INVALID_FILE_SIZE || size > 4 * 1024 * 1024) { CloseHandle(h); return; }
-    std::string data(size, '\0');
-    DWORD rd = 0;
-    if (size > 0) ReadFile(h, &data[0], size, &rd, NULL);
-    CloseHandle(h);
-    data.resize(rd);
-    size_t off = 0;
-    if (data.size() >= 3 && (unsigned char)data[0] == 0xEF && (unsigned char)data[1] == 0xBB && (unsigned char)data[2] == 0xBF)
-        off = 3;
-    if (data.size() <= off) return;
-    const int wn = MultiByteToWideChar(CP_UTF8, 0, data.c_str() + off, (int)(data.size() - off), NULL, 0);
-    if (wn <= 0) return;
-    std::wstring ws((size_t)wn, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, data.c_str() + off, (int)(data.size() - off), &ws[0], wn);
-
+    std::wstring ws;
+    if (!ExReadUtf8(AsDictPath(), ws, &g_asDictTime)) return;
     size_t pos = 0;
     while (pos <= ws.size()) {
         size_t nl = ws.find(L'\n', pos);
         if (nl == std::wstring::npos) nl = ws.size();
-        std::wstring line = ws.substr(pos, nl - pos);
+        const std::wstring line = ws.substr(pos, nl - pos);
         pos = nl + 1;
         size_t b = 0, e = line.size();
         while (b < e && (line[b] == L' ' || line[b] == L'\t' || line[b] == L'\r')) ++b;
@@ -282,7 +265,7 @@ static void AsCreateDictTemplate() {
     if (h == INVALID_HANDLE_VALUE) return;
     const char* t =
         "# LangSwitch: словарь авто-переключения раскладки. Одно слово в строке, строки с # игнорируются, регистр не важен.\r\n"
-        "# Слово из словаря всегда переключается в раскладку, где оно набирается как записано.\r\n"
+        "# Слово из словаря всегда переключается в раскладку, где оно набирается как записано (высший приоритет).\r\n"
         "# Пример: если записать \"бг\", то набранное в английской раскладке \",u\" всегда станет \"бг\".\r\n"
         "# Если записать оба варианта (\"бг\" и \",u\"), переключения для этого слова не будет.\r\n";
     DWORD wr = 0;
@@ -338,6 +321,7 @@ static int AsContext(const std::vector<Rec>& buf, size_t s) {
 
 // Решает, нужно ли переключить последнее слово буфера. pause — проверка по паузе (пороги строже).
 static bool AsDecide(const std::vector<Rec>& buf, bool pause, AsFix& out) {
+    if (AsExcluded()) return false;
     size_t e = buf.size();
     while (e > 0 && buf[e - 1].ch == L' ') --e;
     if (e == 0) return false;
@@ -407,43 +391,43 @@ static bool AsDecide(const std::vector<Rec>& buf, bool pause, AsFix& out) {
                 return true;
             }
         }
+        if (!g_asHeur) continue;  // режим только словаря
 
         int score = -1;
         if (n <= 3) {
-            // короткие слова: только служебные слова целевого языка, в начале текста или в продолжение текста
-            if (pause || langT == AL_NONE || langH == AL_NONE) continue;
+            // короткие слова: служебные слова целевого языка, если набранное слово не похоже на слово
+            if (langT == AL_NONE || langH == AL_NONE) continue;
+            if (n <= 2 && pause) continue;
             if (!AsInShort(langT, ccore) || AsInShort(langH, core)) continue;
-            if (!isStart && ctx != scrT) continue;
+            if (n == 1 && !(isStart || ctx == scrT)) continue;
+            if (n == 2 && !(isStart || ctx == scrT || ctx == 0)) continue;
+            if (n >= 2 && AsRate(AsScoreRuns(core, langH)) > 60) continue;
             score = 60;
         } else {
             if (AsKeysmash(scrH == 1 ? core : ccore)) continue;
-            const bool laugh =
-                AsLaughter(ccore, langT) && (langH != AL_NONE ? !AsLaughter(core, langH) : inner > 0);
+            if (langT == AL_NONE) continue;
+            const bool hKnown = langH != AL_NONE;
+            if (!hKnown && inner == 0) continue;  // язык набранной раскладки неизвестен — только знаки внутри слова
+
+            const AsScore st = AsScoreRuns(ccore, langT);
+            if (st.letters < 4 || st.pairs < 3) continue;
+            const int rc = AsRate(st);
+            int rh = hKnown ? AsRate(AsScoreRuns(core, langH)) : 50;
+            if (inner > 0) rh = rh > 20 ? rh - 20 : 0;  // знак внутри слова в набранной раскладке — признак чужой раскладки
+
+            const bool laugh = AsLaughter(ccore, langT) && (hKnown ? !AsLaughter(core, langH) : inner > 0);
             if (laugh) {
                 score = 90;
             } else {
-                if (langT == AL_NONE) continue;
-                int tmin = 75, hmax = 34, hrun = 67;
+                int tmin = 65, diff = 30;
                 if (ctx == scrH && !(scrH == 2 && langT == AL_EN)) {
-                    tmin = 90; hmax = 20; hrun = 50;  // до этого текст был в той же раскладке: строже
+                    tmin = 75; diff = 40;  // до этого текст был в той же раскладке: строже (английские слова в русском — как обычно)
                 } else if (ctx == scrT) {
-                    tmin = 70; hmax = 40;             // предыдущие слова уже в целевой раскладке: мягче
+                    tmin = 55; diff = 20;  // предыдущие слова уже в целевой раскладке: мягче
                 }
-                if (pause) { tmin += 5; hmax -= 5; hrun -= 5; }
-
-                const AsScore st = AsScoreRuns(ccore, langT);
-                if (!AsTPlausible(st, tmin)) continue;
-
-                bool hImpl;
-                if (langH == AL_NONE) {
-                    hImpl = inner > 0 && st.hits * 100 / st.pairs >= 90;  // язык набранной раскладки неизвестен
-                } else {
-                    const AsScore sh = AsScoreRuns(core, langH);
-                    if (inner > 0) { hmax = std::max(hmax, 50); hrun = std::max(hrun, 67); }
-                    hImpl = AsHImplausible(sh, hmax, hrun, inner > 0);
-                }
-                if (!hImpl) continue;
-                score = st.hits * 100 / st.pairs;
+                if (pause) { tmin += 5; diff += 5; }
+                if (rc < tmin || rc - rh < diff) continue;
+                score = rc;
             }
         }
         if (score > best) {
@@ -471,7 +455,6 @@ struct AsJob {
     size_t snapSize;   // размер буфера в момент решения
 };
 
-static bool g_asOn = false;
 static std::atomic<bool> g_asBusy(false);
 static HWND g_asWnd = NULL;
 static CRITICAL_SECTION g_asCs;
@@ -558,7 +541,11 @@ static unsigned __stdcall AsFixThread(void*) {
             Cycle cy = BuildCycle();
             if (ScriptOfLayout(job.target) == 2) RotateTo(cy.cyr, (UINT_PTR)job.target);
             else RotateTo(cy.lat, (UINT_PTR)job.target);
-            ConvertBuffer(snap, cy, snap.size() - job.regionLen);
+            const size_t st = snap.size() - job.regionLen;
+            ConvertBuffer(snap, cy, st);
+            // слово переключено автоматически: двойной Ctrl дальше работает с текстом от него
+            Lock l;
+            if (!job.sendEnter && !g_resetAfter && g_buf.size() > st) g_buf[st].asStart = true;
         }
     }
 
@@ -595,13 +582,14 @@ static bool AsStartJob(const AsJob& j) {
 }
 
 // ---------------------------------------------------------------- точки входа из хука и таймера
-// Ручная конвертация (двойной Ctrl) при включённом авто-режиме работает только с последним словом
+// Откуда начинать ручную конвертацию (двойной Ctrl): с последнего слова, переключённого автоматически.
+// Если такого нет — (size_t)-1, и работает обычная настройка Scope (весь текст или последнее слово).
 static size_t AsManualStart(const std::vector<Rec>& snap) {
-    if (!g_asOn) return (size_t)-1;
-    size_t i = snap.size();
-    while (i > 0 && snap[i - 1].ch == L' ') --i;
-    while (i > 0 && snap[i - 1].ch != L' ') --i;
-    return i;
+    if (!g_cfg.wholeText) return (size_t)-1;
+    for (size_t i = snap.size(); i-- > 0;) {
+        if (snap[i].asStart) return i;
+    }
+    return (size_t)-1;
 }
 
 static void AsOnTimer() {
@@ -674,7 +662,7 @@ static bool AsEnterPlain() {
 static bool AsWantsEnter() {
     if (g_busy) return false;
     HWND fg = GetForegroundWindow();
-    if (!fg || AsIsConsole(fg)) return false;
+    if (!fg || AsIsConsole(fg) || AsExcluded()) return false;
     std::vector<Rec> snap;
     {
         Lock l;
@@ -694,6 +682,10 @@ static bool AsWantsEnter() {
 // Вызывается после обработки нажатия основным обработчиком (буфер уже обновлён)
 static void AsAfterKey(DWORD vk) {
     if (AsIsPassThrough(vk) || g_busy) return;
+    if (AsExcluded()) {
+        KillTimer(g_asWnd, kAsTimer);
+        return;
+    }
     bool open = false, spaced = false;
     {
         Lock l;
@@ -724,7 +716,7 @@ static void AsAfterKey(DWORD vk) {
     else KillTimer(g_asWnd, kAsTimer);
 }
 
-// Обработчик клавиатуры при включённом авто-режиме: вызывает основной обработчик и добавляет проверку слов
+// Обработчик клавиатуры при включённом модуле: вызывает основной обработчик и добавляет проверку слов
 static LRESULT CALLBACK AsKbProc(int code, WPARAM wp, LPARAM lp) {
     if (code != HC_ACTION) return KbProc(code, wp, lp);
     const KBDLLHOOKSTRUCT* k = (const KBDLLHOOKSTRUCT*)lp;
@@ -740,17 +732,19 @@ static LRESULT CALLBACK AsKbProc(int code, WPARAM wp, LPARAM lp) {
     return r;
 }
 
-// Выбор обработчика клавиатуры при запуске. Если AutoSwitch=0 (по умолчанию) — возвращает обычный обработчик,
-// ничего не инициализируя.
+// Выбор обработчика клавиатуры при запуске.
+// AutoSwitch=1 — полный режим (оценки + словарь); AutoSwitch=0 и есть Words.txt — только словарь;
+// иначе возвращается обычный обработчик, ничего не инициализируя (работа программы как без этого модуля).
 static HOOKPROC AsSetup() {
     const wchar_t* ini = g_iniPath.c_str();
     wchar_t buf[8] = {0};
     GetPrivateProfileStringW(kSection, L"AutoSwitch", L"", buf, 8, ini);
-    if (!buf[0]) {
-        WritePrivateProfileStringW(kSection, L"AutoSwitch", L"0", ini);
-        return KbProc;
-    }
-    if (_wtoi(buf) == 0) return KbProc;
+    if (!buf[0]) WritePrivateProfileStringW(kSection, L"AutoSwitch", L"0", ini);
+    g_asHeur = buf[0] && _wtoi(buf) != 0;
+
+    if (g_asHeur) AsCreateDictTemplate();
+    const bool hasDict = GetFileAttributesW(AsDictPath().c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (!g_asHeur && !hasDict) return KbProc;
 
     InitializeCriticalSection(&g_asCs);
     HINSTANCE hInst = GetModuleHandleW(NULL);
@@ -763,8 +757,6 @@ static HOOKPROC AsSetup() {
     g_asWnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
     if (!g_asWnd) return KbProc;
 
-    AsCreateDictTemplate();
     AsLoadDict();
-    g_asOn = true;
     return AsKbProc;
 }
