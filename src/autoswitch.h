@@ -120,7 +120,8 @@ static int AsLayoutLang(HKL h) {
     int lang = AL_NONE;
     const int script = ScriptOfLayout(h);
     if (script == 1) {
-        if (PrimaryLang(h) == LANG_ENGLISH) lang = AL_EN;
+        if (PRIMARYLANGID(LOWORD(reinterpret_cast<ULONG_PTR>(h))) == LANG_ENGLISH)
+    lang = AL_EN;
     } else if (script == 2) {
         const std::set<wchar_t>& ch = LayoutChars(h);
         if (ch.count(L'ў')) lang = AL_NONE;
