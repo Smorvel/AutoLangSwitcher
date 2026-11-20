@@ -60,11 +60,21 @@ static const wchar_t* kAsShortEn =
 static const wchar_t* kAsShortRu =
     L"я в и к с у о а на не но да ты мы он за из по до от ну же бы ли то во ко со об ни ой ах ох эх уж его все она они "
     L"уже или для мне нет вот тут там при без над под про чем кто где так еще ещё это что как вам вас нам нас мой наш "
-    L"ваш был ага ого ура чей той тот эта эти оно ему ней них ним сам сей ради";
+    L"ваш был ага ого ура чей той тот эта эти оно ему ней них ним сам сей ради "
+    L"меня тебя себя него неё её ее их мои твои твой моя твоя свой своя если когда потому почему очень только также "
+    L"можно нужно будет была были было есть быть этот этой того тому тоже всё всех всем кого кому чего чему какой "
+    L"какая какое какие каких который которая которые просто спасибо пожалуйста привет здравствуйте сейчас теперь "
+    L"тогда здесь сюда туда откуда куда всегда никогда иногда много мало несколько после перед через между около "
+    L"против среди кроме вместо ничего никто опять снова даже лишь именно";
 
 static const wchar_t* kAsShortUk =
     L"я в у і й з до на не та чи це ми ти ви так ні ну ще як що хто де цей той ця ці ось він без для при про над під "
-    L"від але там тут вже аж ох ах ой";
+    L"від але там тут вже аж ох ах ой "
+    L"вона воно вони теж також якщо коли тому чому дуже тільки можна треба буде була були було є бути цього цьому "
+    L"того мене тебе себе нього неї її їх наш наша наші мій моя мої твій твоя свій своя усе все всі всіх всім кого "
+    L"кому чого який яка яке які яких котрий просто дякую будь ласка привіт сьогодні зараз тепер тоді сюди туди "
+    L"звідки куди завжди ніколи іноді багато мало кілька після перед через між навколо проти серед крім замість "
+    L"нічого ніхто знову навіть лише саме ніж";
 
 static void AsFillBigrams(std::set<unsigned>& dst, const wchar_t* list) {
     const wchar_t* p = list;
@@ -149,13 +159,22 @@ static int AsLayoutLang(HKL h) {
         if (PRIMARYLANGID(LOWORD((UINT_PTR)h)) == LANG_ENGLISH) lang = AL_EN;
     } else if (script == 2) {
         const std::set<wchar_t>& ch = LayoutChars(h);
-        if (ch.count(L'ў')) lang = AL_NONE;
-        else if (ch.count(L'ї') || ch.count(L'є') || ch.count(L'ґ')) lang = AL_UK;
-        else if (ch.count(L'ы') || ch.count(L'э')) lang = AL_RU;
+        const WORD pl = PRIMARYLANGID(LOWORD((UINT_PTR)h));
+        // буквы, которые есть только в одном из языков; "і" стоит на основной клавише, поэтому определяется надёжнее остальных
+        const bool hasUk = ch.count(L'і') || ch.count(L'ї') || ch.count(L'є') || ch.count(L'ґ');
+        const bool hasRu = ch.count(L'ы') || ch.count(L'э') || ch.count(L'ъ') || ch.count(L'ё');
+        if (ch.count(L'ў') || pl == LANG_BELARUSIAN) lang = AL_NONE;
+        else if (hasUk && !hasRu) lang = AL_UK;
+        else if (hasRu && !hasUk) lang = AL_RU;
+        else if (pl == LANG_UKRAINIAN) lang = AL_UK;   // буквы не помогли — берём язык раскладки Windows
+        else if (pl == LANG_RUSSIAN) lang = AL_RU;
     }
     cache[(UINT_PTR)h] = lang;
     return lang;
 }
+
+static HKL g_asLastT = NULL;    // раскладка, в которую в последний раз сработало автопереключение
+static DWORD g_asLastTime = 0;
 
 // ---------------------------------------------------------------- оценка слова
 struct AsScore {
@@ -502,21 +521,28 @@ static bool AsDecide(const std::vector<Rec>& buf, bool pause, AsFix& out) {
         }
         if (!g_asHeur) continue;  // режим только словаря
 
-        const bool tKnown = langT != AL_NONE && AsInShort(langT, ccore);
+        const bool tFull = langT != AL_NONE && AsInShort(langT, ccore);
+        // слова, допустимые в русском, но там редкие ("та", "те", "ту"): уступают украинской раскладке
+        const bool tRare = !tFull && langT == AL_RU && (ccore == L"та" || ccore == L"те" || ccore == L"ту");
+        const bool tKnown = tFull || tRare;
         const bool typedKnown = langH != AL_NONE && AsInShort(langH, core);
         if (typedKnown) continue;  // допустимо в своей раскладке: само не переключается (начало текста — AsLookBack)
 
-        // при равной оценке предпочитаем раскладку предыдущего слова, затем последнюю использованную
-        const int bonus = (T == prevHkl) ? 6 : (ci == 0 ? 3 : 0);
+        // Язык слова определяется по содержанию (слово бывает только в одном языке). При равенстве выбирает контекст:
+        // раскладка предыдущего слова, затем язык последнего автопереключения, затем последняя использованная.
+        const DWORD nowT = GetTickCount();
+        const int bonus = (T == prevHkl) ? 8
+                        : (T == g_asLastT && nowT - g_asLastTime < 90000) ? 5
+                        : (ci == 0 ? 3 : 0);
 
         int score = -1;
         if (tKnown) {
-            // известное слово или сокращение целевого языка (я, ты, apk, txt, docx...)
+            // известное слово или сокращение целевого языка (я, ты, та, apk, txt, docx...)
             if (n <= 3 && langH == AL_NONE) continue;
             if (n <= 2 && (pause || edged)) continue;
             // двухбуквенные сокращения могут совпасть с настоящим словом набранного языка ("ем" и "tv")
             if (n == 2 && langT == AL_EN && AsRate(AsScoreRuns(core, langH)) > 50) continue;
-            score = (n <= 3 ? 60 : 70) + bonus;
+            score = (n <= 3 ? 60 : 70) - (tRare ? 6 : 0) + bonus;
         } else if (n == 3) {
             // Неизвестное слово из трёх букв. Переключаем, если в целевой раскладке оно выглядит как слово
             // (обе пары букв допустимы, есть гласная), а в набранной хотя бы одна пара невозможна.
@@ -769,6 +795,8 @@ static unsigned __stdcall AsFixThread(void*) {
             else RotateTo(cy.lat, (UINT_PTR)job.target);
             const size_t st = snap.size() - job.regionLen;
             ConvertBuffer(snap, cy, st, job.target, job.convEnd);
+            g_asLastT = job.target;
+            g_asLastTime = GetTickCount();
             // слово переключено автоматически: двойной Ctrl дальше работает с текстом от него
             Lock l;
             if (!job.sendEnter && !g_resetAfter && g_buf.size() > st) g_buf[st].asStart = true;
