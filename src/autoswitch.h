@@ -163,8 +163,24 @@ struct AsScore {
     bool badStart = false;
 };
 
-// Пары букв считаются только внутри непрерывных групп букв
-static AsScore AsScoreRuns(const std::wstring& s, int lang) {
+// Допустима ли пара букв, которой нет в таблице частых: чередование гласной и согласной допустимо,
+// кроме сочетаний, невозможных в языке. Используется для оценки слова в целевой раскладке:
+// таблицы частых пар неполные, и редкие, но нормальные слова иначе отбрасывались бы.
+static bool AsPairLoose(int lang, wchar_t a, wchar_t b) {
+    if (AsHasBigram(lang, a, b)) return true;
+    if (lang == AL_EN) return a != L'q' && AsVowel(lang, a) != AsVowel(lang, b);
+    if (a == L'ь' || a == L'ъ' || b == L'ь' || b == L'ъ') return false;
+    const bool va = AsVowel(lang, a), vb = AsVowel(lang, b);
+    if (va == vb) return false;
+    if (!va) {  // согласная + гласная
+        if (wcschr(L"жшчщ", a) && wcschr(L"ыяю", b)) return false;
+        if (wcschr(L"гкх", a) && b == L'ы') return false;
+    }
+    return true;
+}
+
+// Пары букв считаются только внутри непрерывных групп букв. loose — допускать пары вне таблицы (см. AsPairLoose).
+static AsScore AsScoreRuns(const std::wstring& s, int lang, bool loose = false) {
     AsScore r;
     int missRun = 0, consRun = 0;
     bool prevLetter = false;
@@ -187,7 +203,7 @@ static AsScore AsScoreRuns(const std::wstring& s, int lang) {
         }
         if (prevLetter) {
             ++r.pairs;
-            if (AsHasBigram(lang, prev, c)) {
+            if (loose ? AsPairLoose(lang, prev, c) : AsHasBigram(lang, prev, c)) {
                 ++r.hits;
                 missRun = 0;
             } else {
@@ -502,12 +518,13 @@ static bool AsDecide(const std::vector<Rec>& buf, bool pause, AsFix& out) {
             if (n == 2 && langT == AL_EN && AsRate(AsScoreRuns(core, langH)) > 50) continue;
             score = (n <= 3 ? 60 : 70) + bonus;
         } else if (n == 3) {
-            // неизвестное слово из трёх букв: в целевой раскладке обе пары букв частые и есть гласная,
-            // а в набранной нет ни одной частой пары ("пфн" -> "gay", ",kz" -> "бля")
+            // Неизвестное слово из трёх букв. Переключаем, если в целевой раскладке оно выглядит как слово
+            // (обе пары букв допустимы, есть гласная), а в набранной хотя бы одна пара невозможна.
             if (!pause && langT != AL_NONE && langH != AL_NONE) {
-                const AsScore st = AsScoreRuns(ccore, langT);
+                const AsScore st = AsScoreRuns(ccore, langT, true);
                 const AsScore sh = AsScoreRuns(core, langH);
-                if (st.letters == 3 && st.pairs == 2 && st.hits == 2 && st.vowels >= 1 && sh.hits == 0)
+                if (st.letters == 3 && st.pairs == 2 && st.hits == 2 && st.vowels >= 1 && !st.badStart &&
+                    sh.hits < sh.pairs)
                     score = 55 + bonus;
             }
         } else if (n > 3) {
@@ -516,7 +533,7 @@ static bool AsDecide(const std::vector<Rec>& buf, bool pause, AsFix& out) {
             const bool hKn = langH != AL_NONE;
             if (!hKn && inner == 0) continue;  // язык набранной раскладки неизвестен — только знаки внутри слова
 
-            const AsScore st = AsScoreRuns(ccore, langT);
+            const AsScore st = AsScoreRuns(ccore, langT, true);
             if (st.letters < 4 || st.pairs < 3) continue;
             const int rc = AsRate(st);
             int rh = hKn ? AsRate(AsScoreRuns(core, langH)) : 50;
@@ -955,8 +972,10 @@ static HOOKPROC AsSetup() {
     g_asHeur = buf[0] && _wtoi(buf) != 0;
 
     if (g_asHeur) AsCreateDictTemplate();
-    const bool hasDict = GetFileAttributesW(AsDictPath().c_str()) != INVALID_FILE_ATTRIBUTES;
-    if (!g_asHeur && !hasDict) return KbProc;
+    AsLoadDict();
+
+    // Автоопределение выключено и в Words.txt нет слов: работает обычный обработчик клавиатуры, как без этого модуля
+    if (!g_asHeur && g_asDict.empty()) return KbProc;
 
     InitializeCriticalSection(&g_asCs);
     HINSTANCE hInst = GetModuleHandleW(NULL);
@@ -968,7 +987,5 @@ static HOOKPROC AsSetup() {
     RegisterClassW(&wc);
     g_asWnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
     if (!g_asWnd) return KbProc;
-
-    AsLoadDict();
     return AsKbProc;
 }
