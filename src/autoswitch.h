@@ -85,12 +85,22 @@ static bool AsHasBigram(int lang, wchar_t a, wchar_t b) {
     if (!init) {
         AsFillBigrams(en, kAsBigEn);
         AsFillBigrams(ru, kAsBigRu);
-        AsFillBigrams(uk, kAsBigRu);
         AsFillBigrams(uk, kAsBigUk);
         init = true;
     }
-    const std::set<unsigned>& t = (lang == AL_EN) ? en : (lang == AL_UK) ? uk : ru;
-    return t.count(((unsigned)a << 16) | (unsigned)b) != 0;
+    const unsigned key = ((unsigned)a << 16) | (unsigned)b;
+    if (lang == AL_EN) return en.count(key) != 0;
+    if (lang == AL_RU) return ru.count(key) != 0;
+
+    // украинский: своя небольшая таблица + русская с заменой близких букв (і, ї -> и; є -> е; ґ -> г).
+    // Букв ы, э, ъ, ё в украинском нет.
+    static const wchar_t* kNotUk = L"ыэъё";
+    if (wcschr(kNotUk, a) || wcschr(kNotUk, b)) return false;
+    if (uk.count(key)) return true;
+    auto m = [](wchar_t c) -> wchar_t {
+        return (c == L'і' || c == L'ї') ? L'и' : (c == L'є') ? L'е' : (c == L'ґ') ? L'г' : c;
+    };
+    return ru.count(((unsigned)m(a) << 16) | (unsigned)m(b)) != 0;
 }
 
 static bool AsInShort(int lang, const std::wstring& w) {
@@ -353,6 +363,12 @@ static bool AsDecide(const std::vector<Rec>& buf, bool pause, AsFix& out) {
     const int ctx = AsContext(buf, s);
     AsReloadDictIfChanged(GetTickCount());
 
+    // раскладка предыдущего слова: при равной оценке предпочитаем её (например, украинскую, а не русскую)
+    HKL prevHkl = NULL;
+    for (size_t i = s; i-- > 0;) {
+        if (buf[i].ch != L' ') { prevHkl = buf[i].cur; break; }
+    }
+
     HKL bestT = NULL;
     int best = -1;
     for (size_t ci = 0; ci < cands.size(); ++ci) {
@@ -393,16 +409,18 @@ static bool AsDecide(const std::vector<Rec>& buf, bool pause, AsFix& out) {
         }
         if (!g_asHeur) continue;  // режим только словаря
 
+        // при равной оценке предпочитаем раскладку предыдущего слова, затем последнюю использованную
+        const int bonus = (T == prevHkl) ? 6 : (ci == 0 ? 3 : 0);
+
         int score = -1;
         if (n <= 3) {
-            // короткие слова: служебные слова целевого языка, если набранное слово не похоже на слово
+            // короткие слова: служебные слова целевого языка, если набранное слово само не является служебным
             if (langT == AL_NONE || langH == AL_NONE) continue;
             if (n <= 2 && pause) continue;
             if (!AsInShort(langT, ccore) || AsInShort(langH, core)) continue;
-            if (n == 1 && !(isStart || ctx == scrT)) continue;
-            if (n == 2 && !(isStart || ctx == scrT || ctx == 0)) continue;
-            if (n >= 2 && AsRate(AsScoreRuns(core, langH)) > 60) continue;
-            score = 60;
+            if (n == 1 && (a != 0 || b != w.size())) continue;              // одиночная буква без знаков вокруг
+            if (n == 3 && AsRate(AsScoreRuns(core, langH)) > 85) continue;  // очень похоже на настоящее слово
+            score = 60 + bonus;
         } else {
             if (AsKeysmash(scrH == 1 ? core : ccore)) continue;
             if (langT == AL_NONE) continue;
@@ -417,17 +435,13 @@ static bool AsDecide(const std::vector<Rec>& buf, bool pause, AsFix& out) {
 
             const bool laugh = AsLaughter(ccore, langT) && (hKnown ? !AsLaughter(core, langH) : inner > 0);
             if (laugh) {
-                score = 90;
+                score = 90 + bonus;
             } else {
                 int tmin = 65, diff = 30;
-                if (ctx == scrH && !(scrH == 2 && langT == AL_EN)) {
-                    tmin = 75; diff = 40;  // до этого текст был в той же раскладке: строже (английские слова в русском — как обычно)
-                } else if (ctx == scrT) {
-                    tmin = 55; diff = 20;  // предыдущие слова уже в целевой раскладке: мягче
-                }
+                if (ctx == scrT) { tmin = 55; diff = 20; }  // предыдущие слова уже в целевой раскладке: мягче
                 if (pause) { tmin += 5; diff += 5; }
                 if (rc < tmin || rc - rh < diff) continue;
-                score = rc;
+                score = rc + bonus;
             }
         }
         if (score > best) {
