@@ -368,6 +368,7 @@ static HKL NextTarget(HKL home, HKL cur, const Cycle& cy) {
     const std::vector<HKL>& opp = (ScriptOfLayout(home) == 1) ? cy.cyr : cy.lat;
     if (opp.empty()) return cur;
     if (cur == home) return opp[0];
+    if (ScriptOfLayout(cur) == ScriptOfLayout(home)) return home;  // после замены на раскладку того же алфавита (русская <-> украинская): возврат
     for (size_t i = 0; i < opp.size(); ++i) {
         if (opp[i] == cur) return (i + 1 < opp.size()) ? opp[i + 1] : home;
     }
@@ -1318,7 +1319,8 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
     return true;
 }
 
-static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle, size_t forceStart = (size_t)-1) {
+static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle, size_t forceStart = (size_t)-1,
+                          HKL forceTarget = NULL, size_t forceEnd = (size_t)-1) {
     if (snap.empty()) return;
     if (cycle.lat.empty() || cycle.cyr.empty()) return;  // нужны и латинская, и кириллическая раскладки
 
@@ -1338,8 +1340,8 @@ static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle, size
     std::wstring newText;
     for (size_t i = start; i < snap.size(); ++i) {
         Rec r = snap[i];
-        if (!r.neutral) {
-            const HKL target = NextTarget(r.home, r.cur, cycle);
+        if (!r.neutral && i < forceEnd) {
+            const HKL target = forceTarget ? forceTarget : NextTarget(r.home, r.cur, cycle);
             if (target != r.cur) {
                 r.ch = (target == r.home) ? r.origCh : ConvChar(r.origCh, r.home, target);
                 r.cur = target;
