@@ -361,18 +361,30 @@ static void NoteLayoutUsed(HKL h) {
     else if (s == 2) g_lastCyr = (UINT_PTR)h;
 }
 
-// В какую раскладку превратить символ, набранный в home и находящийся сейчас в cur.
-// Цепочка: home -> раскладки противоположного алфавита по порядку -> снова home.
-// При двух раскладках это просто переключение туда и обратно.
-static HKL NextTarget(HKL home, HKL cur, const Cycle& cy) {
-    const std::vector<HKL>& opp = (ScriptOfLayout(home) == 1) ? cy.cyr : cy.lat;
-    if (opp.empty()) return cur;
-    if (cur == home) return opp[0];
-    if (ScriptOfLayout(cur) == ScriptOfLayout(home)) return home;  // после замены на раскладку того же алфавита (русская <-> украинская): возврат
-    for (size_t i = 0; i < opp.size(); ++i) {
-        if (opp[i] == cur) return (i + 1 < opp.size()) ? opp[i + 1] : home;
+// Последовательность раскладок для повторных нажатий двойного Ctrl, начиная с исходной:
+// исходная -> раскладки другого алфавита (последние использованные первыми) -> остальные раскладки того же алфавита.
+// При двух раскладках это просто переключение туда и обратно, при трёх — круг из трёх.
+static std::vector<HKL> LayoutSeq(HKL home, const Cycle& cy) {
+    std::vector<HKL> seq;
+    seq.push_back(home);
+    const bool homeLat = ScriptOfLayout(home) == 1;
+    const std::vector<HKL>& opp = homeLat ? cy.cyr : cy.lat;
+    const std::vector<HKL>& same = homeLat ? cy.lat : cy.cyr;
+    for (size_t i = 0; i < opp.size(); ++i) seq.push_back(opp[i]);
+    for (size_t i = 0; i < same.size(); ++i) {
+        if (same[i] != home) seq.push_back(same[i]);
     }
-    return opp[0];
+    return seq;
+}
+
+// В какую раскладку превратить символ, набранный в home и находящийся сейчас в cur
+static HKL NextTarget(HKL home, HKL cur, const Cycle& cy) {
+    const std::vector<HKL> seq = LayoutSeq(home, cy);
+    if (seq.size() < 2) return cur;
+    for (size_t i = 0; i < seq.size(); ++i) {
+        if (seq[i] == cur) return seq[(i + 1) % seq.size()];
+    }
+    return seq[1];
 }
 
 // Если в системе ровно две раскладки — вторая из них
@@ -1160,13 +1172,10 @@ static SelResult ConvertSelectionText(const std::wstring& src, int step, const C
     const HKL C0 = PickHome(cy.cyr, src, true);
     const std::vector<unsigned char> cls = lm::ClassifyText(src, MapFor(L0, C0), MapFor(C0, L0), defaultCyr);
 
-    // idx == 0 — исходная раскладка (как набрано), иначе — раскладки противоположного алфавита по кругу
-    auto targetFor = [&](HKL home, const std::vector<HKL>& opp) -> HKL {
-        const size_t idx = (size_t)step % (opp.size() + 1);
-        return idx == 0 ? home : opp[idx - 1];
-    };
-    const HKL tLat = targetFor(L0, cy.cyr);  // куда превращаем символы, набранные латиницей
-    const HKL tCyr = targetFor(C0, cy.lat);  // куда — набранные кириллицей
+    // круг раскладок для каждого алфавита (исходная -> другого алфавита -> остальные того же алфавита)
+    const std::vector<HKL> seqL = LayoutSeq(L0, cy), seqC = LayoutSeq(C0, cy);
+    const HKL tLat = seqL[(size_t)step % seqL.size()];  // куда превращаем символы, набранные латиницей
+    const HKL tCyr = seqC[(size_t)step % seqC.size()];  // куда — набранные кириллицей
 
     for (size_t i = 0; i < src.size(); ++i) {
         if (cls[i] == lm::CC_LATIN) r.text[i] = ConvChar(src[i], L0, tLat);
@@ -1322,7 +1331,7 @@ static bool ConvertSelection(bool byMouse, POINT down, POINT up, bool trusted) {
 static void ConvertBuffer(const std::vector<Rec>& snap, const Cycle& cycle, size_t forceStart = (size_t)-1,
                           HKL forceTarget = NULL, size_t forceEnd = (size_t)-1) {
     if (snap.empty()) return;
-    if (cycle.lat.empty() || cycle.cyr.empty()) return;  // нужны и латинская, и кириллическая раскладки
+    if (!forceTarget && (cycle.lat.empty() || cycle.cyr.empty())) return;  // нужны и латинская, и кириллическая раскладки
 
     size_t start = 0;
     if (forceStart != (size_t)-1) {
